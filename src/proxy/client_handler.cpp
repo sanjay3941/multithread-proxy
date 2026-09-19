@@ -56,10 +56,18 @@ void ClientHandler::run() noexcept {
         } else {
             handleHttp(request.first, request.second);
         }
-    } catch (const std::exception& error) {
+    } catch (const std::invalid_argument& error) {
         std::cerr << "client handler: " << error.what() << '\n';
         try {
             const std::string response = "HTTP/1.1 400 Bad Request\r\n"
+                                         "Connection: close\r\nContent-Length: 0\r\n\r\n";
+            client_.sendAll(response.data(), response.size());
+        } catch (...) {
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "client handler: " << error.what() << '\n';
+        try {
+            const std::string response = "HTTP/1.1 502 Bad Gateway\r\n"
                                          "Connection: close\r\nContent-Length: 0\r\n\r\n";
             client_.sendAll(response.data(), response.size());
         } catch (...) {

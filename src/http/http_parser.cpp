@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <sstream>
 #include <stdexcept>
 
@@ -43,6 +44,14 @@ void parseAuthority(const std::string& authority, std::string& host, std::string
         }
     }
     if (host.empty() || port.empty()) throw std::invalid_argument("invalid authority");
+
+    unsigned int portNumber = 0;
+    const auto* begin = port.data();
+    const auto* end = begin + port.size();
+    const auto result = std::from_chars(begin, end, portNumber);
+    if (result.ec != std::errc{} || result.ptr != end || portNumber == 0 || portNumber > 65535) {
+        throw std::invalid_argument("invalid port");
+    }
 }
 
 } // namespace

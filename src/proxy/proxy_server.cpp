@@ -38,15 +38,17 @@ void ProxyServer::start() {
         try {
             auto client = listener_.accept();
             auto done = std::make_shared<std::atomic_bool>(false);
-            std::lock_guard<std::mutex> lock(workersMutex_);
             Worker worker{
                 std::thread([connection = std::move(client), done]() mutable {
                 ClientHandler(std::move(connection)).run();
                 done->store(true);
             }),
                 done};
-            workers_.push_back(std::move(worker));
-            reapFinishedWorkers();
+            {
+                std::lock_guard<std::mutex> lock(workersMutex_);
+                workers_.push_back(std::move(worker));
+                reapFinishedWorkers();
+            }
         } catch (const std::exception& error) {
             std::cerr << "accept loop: " << error.what() << '\n';
         }
