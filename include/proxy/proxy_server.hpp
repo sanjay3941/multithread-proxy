@@ -20,6 +20,7 @@ public:
     ProxyServer(const ProxyServer&) = delete;
     ProxyServer& operator=(const ProxyServer&) = delete;
     void start();
+    void printStatistics() const;
 
 private:
     struct Worker {

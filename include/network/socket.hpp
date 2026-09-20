@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <sys/types.h>
 #include <string>
+#include <utility>
 
 namespace network {
 
@@ -24,6 +25,7 @@ public:
     void bindAndListen(const std::string& host, std::uint16_t port,
                        int backlog = 128);
     Socket accept() const;
+    std::pair<std::string, std::uint16_t> peerAddress() const;
 
     std::size_t sendAll(const void* data, std::size_t length) const;
     ssize_t receive(void* buffer, std::size_t length) const;

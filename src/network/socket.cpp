@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
 
 namespace network {
 namespace {
@@ -109,6 +110,21 @@ Socket Socket::accept() const {
         throw systemError("accept");
     }
     return Socket(client);
+}
+
+std::pair<std::string, std::uint16_t> Socket::peerAddress() const {
+    sockaddr_storage address{};
+    socklen_t length = sizeof(address);
+    if (::getpeername(descriptor_, reinterpret_cast<sockaddr*>(&address), &length) < 0) {
+        throw systemError("getpeername");
+    }
+    char host[NI_MAXHOST]{};
+    char service[NI_MAXSERV]{};
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&address), length, host, sizeof(host),
+                      service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        throw std::runtime_error("getnameinfo: unable to determine client address");
+    }
+    return {host, static_cast<std::uint16_t>(std::stoul(service))};
 }
 
 std::size_t Socket::sendAll(const void* data, std::size_t length) const {

@@ -9,6 +9,8 @@ add_executable(cpp_proxy
     src/main.cpp
     src/network/socket.cpp
     src/http/http_parser.cpp
+    src/logging/logger.cpp
+    src/logging/statistics.cpp
     src/proxy/client_handler.cpp
     src/proxy/proxy_server.cpp
 )
