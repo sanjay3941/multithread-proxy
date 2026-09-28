@@ -62,10 +62,8 @@ void ProxyServer::stop() {
 // visible in the logs through repeated THREAD= values across different
 // REQ-* entries.
 //
-// HTTPS CONNECT note: handleConnect() spawns two relay threads internally
-// and blocks the worker until both join (i.e. until the tunnel closes).
-// A single HTTPS session therefore occupies one worker for its entire
-// lifetime.  This is unchanged from the previous design.
+// HTTPS CONNECT forwards both directions with poll() in this worker.
+// A tunnel occupies one worker until the connection closes.
 void ProxyServer::workerLoop() {
     WorkItem item;
     while (queue_.pop(item)) {

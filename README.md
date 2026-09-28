@@ -61,9 +61,11 @@ The command-line interface accepts up to three positional arguments:
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| port | 8080 | TCP port to listen on. |
-| workers | 4 | Number of worker threads. |
-| queue | 16 | Maximum connections in the work queue. |
+| port | 8080 | TCP port to listen on (1–65535). |
+| workers | 4 | Number of worker threads (1–256). |
+| queue | 16 | Maximum connections in the work queue (1–4096). |
+
+Arguments must be positive decimal integers in these ranges. Invalid values exit with usage status 2 before the server starts.
 
 The bind address is always `0.0.0.0` (all IPv4 interfaces).
 
@@ -99,7 +101,7 @@ After connecting to the destination, the proxy sends:
 HTTP/1.1 200 Connection Established
 ```
 
-Two relay threads are spawned inside the client worker to forward traffic in both directions; the worker blocks until both joins complete. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
+The client worker uses `poll()` to forward traffic in both directions and remains occupied until the tunnel closes. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
 
 ## Concurrency and Socket Management
 
@@ -114,7 +116,7 @@ Two relay threads are spawned inside the client worker to forward traffic in bot
 
 **Worker reuse.** After finishing a connection a worker loops back and calls `WorkQueue::pop()`, blocking until the next item arrives. The same OS thread handles many successive connections. The `THREAD=` field in every log line makes this visible: the same thread ID appears across multiple `REQ-*` entries.
 
-**HTTPS tunnel occupancy.** `handleConnect()` spawns two relay threads for bidirectional forwarding and joins both before returning. The worker thread is blocked for the full tunnel lifetime. With a 120-second idle timeout a long-lived HTTPS session can hold one worker for up to two minutes; plan pool size accordingly.
+**HTTPS tunnel occupancy.** `handleConnect()` uses `poll()` for bidirectional forwarding within the client worker. A tunnel occupies one worker for its lifetime. The 120-second idle timeout resets when traffic flows in either direction; an active tunnel can last longer, so plan pool size accordingly.
 
 **Shutdown.** When `ProxyServer` destructs after `start()` returns, the following sequence runs:
 
@@ -189,6 +191,12 @@ Run the local timeout regression checks with Python 3 after building:
 python3 tests/test_timeouts.py build/cpp_proxy
 ```
 
+Run the focused worker-pool check with:
+
+```bash
+python3 tests/test_worker_pool.py build/cpp_proxy
+```
+
 The checks use loopback fixtures, the configured timeout values, and a temporary log directory. They take a few minutes and do not require root access or external servers.
 
 To test from another device on a reachable network, configure its manual HTTP proxy with the Linux machine's reachable IPv4 address and the selected listening port. The device must support the proxy setting, and the host firewall must allow that connection.
@@ -231,7 +239,9 @@ multithread-proxy/
 |   |-- proxy/proxy_server.cpp
 |   `-- proxy/work_queue.cpp
 |-- build/                    # Generated build files and executable
-|-- tests/test_timeouts.py     # Local timeout regression checks
+|-- tests/
+|   |-- test_timeouts.py       # Local timeout regression checks
+|   `-- test_worker_pool.py    # Queue limit, recovery, and worker reuse
 `-- logs/                     # Runtime logs when started from the repository root
 ```
 
