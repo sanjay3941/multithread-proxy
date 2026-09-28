@@ -1,39 +1,56 @@
 #pragma once
 
 #include "network/socket.hpp"
+#include "proxy/work_queue.hpp"
 
-#include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace proxy {
 
+/// HTTP/HTTPS forward proxy backed by a fixed-size worker thread pool.
+///
+/// A bounded queue decouples the accept loop from the workers.  When the
+/// queue is full the new connection is logged and closed immediately so
+/// the accept loop never blocks.  Workers are started in the constructor
+/// and joined in the destructor; active connections are allowed to finish
+/// naturally before the join.
 class ProxyServer {
 public:
-    explicit ProxyServer(std::uint16_t port, std::string bindAddress = "0.0.0.0");
+    static constexpr std::size_t kDefaultWorkerCount = 4;
+    static constexpr std::size_t kDefaultQueueSize   = 16;
+
+    /// \param port          TCP port to listen on.
+    /// \param bindAddress   IPv4 address to bind (default "0.0.0.0").
+    /// \param workerCount   Fixed number of worker threads (default 4).
+    /// \param queueSize     Maximum pending connections in the queue (default 16).
+    explicit ProxyServer(std::uint16_t port,
+                         std::string   bindAddress = "0.0.0.0",
+                         std::size_t   workerCount = kDefaultWorkerCount,
+                         std::size_t   queueSize   = kDefaultQueueSize);
     ~ProxyServer();
 
-    ProxyServer(const ProxyServer&) = delete;
+    ProxyServer(const ProxyServer&)            = delete;
     ProxyServer& operator=(const ProxyServer&) = delete;
+
+    /// Runs the accept loop.  Blocks until accept() throws (e.g. when the
+    /// listener is closed during shutdown).
     void start();
     void printStatistics() const;
 
 private:
-    struct Worker {
-        std::thread thread;
-        std::shared_ptr<std::atomic_bool> done;
-    };
+    void workerLoop();
+    void stop();
 
-    void reapFinishedWorkers();
-    std::uint16_t port_;
-    std::string bindAddress_;
-    network::Socket listener_;
-    std::mutex workersMutex_;
-    std::vector<Worker> workers_;
+    std::uint16_t            port_;
+    std::string              bindAddress_;
+    std::size_t              workerCount_;
+    network::Socket          listener_;
+    WorkQueue                queue_;
+    std::vector<std::thread> workers_;
 };
 
 } // namespace proxy

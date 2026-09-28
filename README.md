@@ -7,7 +7,7 @@ A C++17 forward proxy for Linux and POSIX environments, implemented with TCP soc
 - HTTP request parsing and forwarding, including absolute-URL to origin-form conversion.
 - Request-body forwarding based on `Content-Length`.
 - HTTPS tunneling with bidirectional TCP forwarding.
-- A dedicated worker thread for each client connection.
+- A fixed worker thread pool with a bounded, thread-safe connection queue.
 - Move-only RAII socket ownership and automatic descriptor cleanup.
 - Connection lifecycle logging to the console and a log file.
 - Per-connection byte counts, duration, destination, and status tracking.
@@ -53,7 +53,19 @@ The default listening address is `0.0.0.0:8080`. To select another port:
 ./build/cpp_proxy 3128
 ```
 
-The command-line interface accepts a port argument. The bind address is configured through the `ProxyServer` constructor and is not exposed as a command-line option.
+The command-line interface accepts up to three positional arguments:
+
+```text
+./build/cpp_proxy [port [workers [queue]]]
+```
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| port | 8080 | TCP port to listen on. |
+| workers | 4 | Number of worker threads. |
+| queue | 16 | Maximum connections in the work queue. |
+
+The bind address is always `0.0.0.0` (all IPv4 interfaces).
 
 The listener accepts IPv4 connections on all local interfaces by default. Use the proxy on a trusted network: authentication, destination restrictions, and rate limiting are not implemented.
 
@@ -87,11 +99,32 @@ After connecting to the destination, the proxy sends:
 HTTP/1.1 200 Connection Established
 ```
 
-The client worker uses `poll()` to relay traffic in both directions. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
+Two relay threads are spawned inside the client worker to forward traffic in both directions; the worker blocks until both joins complete. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
 
 ## Concurrency and Socket Management
 
-`ProxyServer` accepts connections and starts one worker thread per client. Completed workers are joined and removed as subsequent connections are accepted. HTTPS forwarding stays within that client worker, with activity in either direction keeping the tunnel alive.
+`ProxyServer` maintains a fixed pool of worker threads and a bounded queue of accepted connections.
+
+| Parameter | Default | CLI position | Description |
+| --- | --- | --- | --- |
+| Worker count | 4 | argv[2] | OS threads that run `ClientHandler::run()`. |
+| Queue capacity | 16 | argv[3] | Maximum sockets waiting to be picked up. |
+
+**Rejection.** When the queue is full the new socket is closed immediately, a `STATUS=REJECTED REASON=QUEUE_FULL` warning is logged, and the connection is counted as failed. The accept loop is never blocked.
+
+**Worker reuse.** After finishing a connection a worker loops back and calls `WorkQueue::pop()`, blocking until the next item arrives. The same OS thread handles many successive connections. The `THREAD=` field in every log line makes this visible: the same thread ID appears across multiple `REQ-*` entries.
+
+**HTTPS tunnel occupancy.** `handleConnect()` spawns two relay threads for bidirectional forwarding and joins both before returning. The worker thread is blocked for the full tunnel lifetime. With a 120-second idle timeout a long-lived HTTPS session can hold one worker for up to two minutes; plan pool size accordingly.
+
+**Shutdown.** When `ProxyServer` destructs after `start()` returns, the following sequence runs:
+
+1. The listener socket is closed so any blocked `accept()` fails immediately.
+2. `WorkQueue::stop()` sets a stopped flag and wakes all idle workers.
+3. `WorkQueue::drain()` closes every socket still waiting in the queue.
+4. All worker threads are joined; workers mid-`ClientHandler::run()` finish their current connection (bounded by timeouts) before the join completes.
+5. Aggregate statistics are printed.
+
+Normal termination with Ctrl+C sends SIGINT, which kills the process without running the destructor. A signal handler is not included in this change.
 
 `network::Socket` owns a socket descriptor, closes it on destruction, and supports move semantics. Its send operation handles partial writes, and its receive operation retries interrupted system calls. The program ignores `SIGPIPE` and uses `MSG_NOSIGNAL` when sending data.
 
@@ -195,7 +228,8 @@ multithread-proxy/
 |   |-- logging/statistics.cpp
 |   |-- network/socket.cpp
 |   |-- proxy/client_handler.cpp
-|   `-- proxy/proxy_server.cpp
+|   |-- proxy/proxy_server.cpp
+|   `-- proxy/work_queue.cpp
 |-- build/                    # Generated build files and executable
 |-- tests/test_timeouts.py     # Local timeout regression checks
 `-- logs/                     # Runtime logs when started from the repository root
@@ -207,7 +241,7 @@ multithread-proxy/
 - No chunked request-body forwarding or complete HTTP/1.1 compatibility.
 - No IPv6 listener, although outbound connections can use IPv6.
 - No proxy authentication, destination filtering, caching, or rate limiting.
-- No active-connection limits; each connection uses a worker thread.
+- Fixed worker pool (default 4 workers, 16-slot queue); HTTPS tunnels each occupy one worker for their full lifetime.
 - DNS resolution is not covered by the TCP connection timeout.
 - No graceful signal-based shutdown or periodic statistics reporting.
 - No TLS interception, log rotation, or traffic dashboard.
