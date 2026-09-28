@@ -3,10 +3,13 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <utility>
 
@@ -46,7 +49,8 @@ Socket Socket::createTcp() {
     return Socket(descriptor);
 }
 
-Socket Socket::connectTo(const std::string& host, const std::string& port) {
+Socket Socket::connectTo(const std::string& host, const std::string& port,
+                         int connectTimeoutSeconds) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -64,15 +68,53 @@ Socket Socket::connectTo(const std::string& host, const std::string& port) {
             lastError = errno;
             continue;
         }
+
+        if (connectTimeoutSeconds > 0) {
+            // Switch to non-blocking so connect() returns EINPROGRESS immediately.
+            const int flags = ::fcntl(connected, F_GETFL, 0);
+            ::fcntl(connected, F_SETFL, flags | O_NONBLOCK);
+        }
+
         if (::connect(connected, address->ai_addr, address->ai_addrlen) == 0) {
+            // Immediate success (common on loopback).
+            if (connectTimeoutSeconds > 0) {
+                const int flags = ::fcntl(connected, F_GETFL, 0);
+                ::fcntl(connected, F_SETFL, flags & ~O_NONBLOCK);
+            }
             break;
         }
-        lastError = errno;
+
+        if (connectTimeoutSeconds > 0 && errno == EINPROGRESS) {
+            pollfd pfd{};
+            pfd.fd = connected;
+            pfd.events = POLLOUT;
+            const int pollResult = ::poll(&pfd, 1, connectTimeoutSeconds * 1000);
+            if (pollResult > 0) {
+                int soError = 0;
+                socklen_t soErrorLen = sizeof(soError);
+                ::getsockopt(connected, SOL_SOCKET, SO_ERROR, &soError, &soErrorLen);
+                if (soError == 0) {
+                    // Connection established — restore blocking mode.
+                    const int flags = ::fcntl(connected, F_GETFL, 0);
+                    ::fcntl(connected, F_SETFL, flags & ~O_NONBLOCK);
+                    break;
+                }
+                lastError = soError;
+            } else if (pollResult == 0) {
+                lastError = ETIMEDOUT;
+            } else {
+                lastError = errno;
+            }
+        } else {
+            lastError = errno;
+        }
+
         ::close(connected);
         connected = -1;
     }
     ::freeaddrinfo(results);
     if (connected < 0) {
+        if (lastError == ETIMEDOUT) throw TimeoutError("upstream connect timed out");
         errno = lastError;
         throw systemError("connect");
     }
@@ -136,6 +178,9 @@ std::size_t Socket::sendAll(const void* data, std::size_t length) const {
             continue;
         }
         if (count <= 0) {
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)) {
+                throw TimeoutError("socket send timed out");
+            }
             throw systemError("send");
         }
         sent += static_cast<std::size_t>(count);
@@ -149,6 +194,24 @@ ssize_t Socket::receive(void* buffer, std::size_t length) const {
         count = ::recv(descriptor_, buffer, length, 0);
     } while (count < 0 && errno == EINTR);
     return count;
+}
+
+void Socket::setReceiveTimeout(int seconds) {
+    timeval tv{};
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    if (::setsockopt(descriptor_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        throw systemError("setsockopt SO_RCVTIMEO");
+    }
+}
+
+void Socket::setSendTimeout(int seconds) {
+    timeval tv{};
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    if (::setsockopt(descriptor_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        throw systemError("setsockopt SO_SNDTIMEO");
+    }
 }
 
 void Socket::shutdown() {

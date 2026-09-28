@@ -1,373 +1,220 @@
 # Multithreaded HTTP/HTTPS Forward Proxy
 
-A multithreaded HTTP/HTTPS forward proxy server implemented in C++17 using POSIX TCP sockets.
-
-The proxy accepts client connections, processes HTTP requests, forwards traffic to destination servers, and supports HTTPS through the HTTP `CONNECT` tunneling mechanism.
-
-The project was developed and tested on Linux/Kali Linux and has been successfully tested with both local clients and an external smartphone connected through the same network.
+A C++17 forward proxy for Linux and POSIX environments, implemented with TCP sockets and `std::thread`. It forwards HTTP requests and supports HTTPS through HTTP `CONNECT` tunnels. HTTPS traffic remains encrypted between the client and destination server.
 
 ## Features
 
-- HTTP forward proxy
-- HTTPS CONNECT tunneling
-- Multithreaded client handling using `std::thread`
-- POSIX TCP socket programming
-- Custom RAII-based socket wrapper
-- HTTP request parsing
-- HTTP header processing
-- HTTP request forwarding
-- HTTP response forwarding
-- HTTPS bidirectional TCP forwarding
-- IPv4 support
-- External device support
-- Client and upstream connection error handling
-- CMake-based build system
-- TLS traffic forwarding without decryption
+- HTTP request parsing and forwarding, including absolute-URL to origin-form conversion.
+- Request-body forwarding based on `Content-Length`.
+- HTTPS tunneling with bidirectional TCP forwarding.
+- A dedicated worker thread for each client connection.
+- Move-only RAII socket ownership and automatic descriptor cleanup.
+- Connection lifecycle logging to the console and a log file.
+- Per-connection byte counts, duration, destination, and status tracking.
+- Aggregate connection statistics maintained with atomic counters.
+- CMake build configuration with compiler warnings enabled on UNIX.
 
-## How It Works
+## Requirements
 
-The proxy listens for incoming TCP connections on a configurable port.
+- Linux or a compatible POSIX environment.
+- A C++17 compiler and standard library with filesystem support.
+- CMake 3.16 or later.
+- POSIX sockets and pthread support.
 
-When a client connects, the server creates a dedicated worker thread to handle that connection.
+On Debian-based systems, including Kali Linux:
 
-For HTTP requests, the proxy:
+```bash
+sudo apt update
+sudo apt install build-essential cmake
+```
 
-1. Accepts the client connection.
-2. Reads the HTTP request.
-3. Parses the request method, host, port, path, HTTP version, and headers.
-4. Converts proxy-style absolute URLs into origin-form requests when required.
-5. Removes proxy-specific headers.
-6. Establishes a connection with the destination server.
-7. Forwards the request to the destination server.
-8. Receives the response.
-9. Sends the response back to the client.
-10. Closes the connection.
+## Build
 
-For HTTPS requests, the client first sends an HTTP `CONNECT` request.
+```bash
+git clone https://github.com/sanjay3941/multithread-proxy.git
+cd multithread-proxy
+cmake -S . -B build
+cmake --build build --parallel
+```
 
-For example:
+The executable is `build/cpp_proxy`.
+
+## Run
+
+From the repository root:
+
+```bash
+./build/cpp_proxy
+```
+
+The default listening address is `0.0.0.0:8080`. To select another port:
+
+```bash
+./build/cpp_proxy 3128
+```
+
+The command-line interface accepts a port argument. The bind address is configured through the `ProxyServer` constructor and is not exposed as a command-line option.
+
+The listener accepts IPv4 connections on all local interfaces by default. Use the proxy on a trusted network: authentication, destination restrictions, and rate limiting are not implemented.
+
+## Request Processing
+
+### HTTP
+
+For each client connection, the proxy:
+
+1. Reads the request headers and parses the method, destination, port, path, version, and headers.
+2. Opens a TCP connection to the destination server.
+3. Converts an absolute request target such as `http://example.com/index.html` to `/index.html`.
+4. Removes the incoming `Connection` and `Proxy-Connection` headers and adds `Connection: close`.
+5. Forwards the request body when `Content-Length` is provided.
+6. Relays the upstream response to the client and closes the connection.
+
+Each HTTP connection handles one request and response. Persistent client connections and chunked request-body forwarding are not implemented.
+
+### HTTPS
+
+Clients establish an HTTPS tunnel using a request such as:
 
 ```http
 CONNECT example.com:443 HTTP/1.1
 Host: example.com:443
 ```
 
-The proxy establishes a TCP connection to the requested destination and responds with:
+After connecting to the destination, the proxy sends:
 
 ```http
 HTTP/1.1 200 Connection Established
 ```
 
-After this, the proxy forwards encrypted TLS traffic between the client and destination server.
+The client worker uses `poll()` to relay traffic in both directions. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
 
-The proxy does not decrypt or inspect the HTTPS application data.
+## Concurrency and Socket Management
 
-## Multithreading
+`ProxyServer` accepts connections and starts one worker thread per client. Completed workers are joined and removed as subsequent connections are accepted. HTTPS forwarding stays within that client worker, with activity in either direction keeping the tunnel alive.
 
-The proxy uses a thread-per-client architecture.
+`network::Socket` owns a socket descriptor, closes it on destruction, and supports move semantics. Its send operation handles partial writes, and its receive operation retries interrupted system calls. The program ignores `SIGPIPE` and uses `MSG_NOSIGNAL` when sending data.
 
-Each accepted client connection is handled by a separate `std::thread`.
+The listener is IPv4-only. Outbound hostname resolution uses `AF_UNSPEC`, allowing attempts to connect to either IPv4 or IPv6 destination addresses when available.
 
-HTTPS connections additionally use separate forwarding threads for bidirectional data transfer between the client and destination server.
+## Timeouts
 
-The implementation avoids sharing request state between client workers, allowing multiple connections to be processed concurrently.
+Timeout values are defined in `include/proxy/timeouts.hpp`:
 
-Socket resources are managed using RAII to ensure that file descriptors are properly released.
+| Operation | Default | Behavior |
+| --- | --- | --- |
+| Client headers | 30 seconds | Total deadline, including clients that send headers slowly. |
+| Upstream TCP connection | 10 seconds | Applies to each candidate address; DNS resolution is separate. |
+| HTTP upstream read | 60 seconds | Maximum wait for the next response data. |
+| HTTPS tunnel idle | 120 seconds | Resets when traffic is forwarded in either direction. |
+| Socket write | 60 seconds | Bounds a blocked write to either peer. |
 
-## Project Structure
+HTTP request-body reads retain the 30-second client receive timeout. Read and write timeouts bound individual waits, not the total duration of an active transfer. Kernel socket timeouts may expire slightly later than their configured value.
 
-```text
-multithread-proxy/
-│
-├── include/
-│   ├── http/
-│   │   └── http_parser.hpp
-│   ├── network/
-│   │   └── socket.hpp
-│   └── proxy/
-│       ├── client_handler.hpp
-│       └── proxy_server.hpp
-│
-├── src/
-│   ├── http/
-│   │   └── http_parser.cpp
-│   ├── network/
-│   │   └── socket.cpp
-│   ├── proxy/
-│   │   ├── client_handler.cpp
-│   │   └── proxy_server.cpp
-│   └── main.cpp
-│
-├── CMakeLists.txt
-├── .gitignore
-└── README.md
-```
+## Logging and Statistics
 
-## Requirements
+### Connection Logs
 
-The project currently targets Linux/POSIX environments.
+The logger writes to standard output and appends to `logs/proxy.log`, relative to the process working directory. Running the executable from the repository root keeps logs in the repository's `logs` directory.
 
-Required:
+Log entries include a timestamp, severity, and thread ID. Connection events use identifiers such as `REQ-000001` to associate messages with a request. Depending on the event, entries include:
 
-- Linux
-- C++17 compatible compiler
-- CMake
-- POSIX sockets
-- pthread support
+- Client address and port.
+- HTTP method, protocol classification, destination, and request path.
+- Upstream connection and tunnel establishment status.
+- Disconnect events and forwarding errors.
+- HTTP response status, when captured.
+- Connection duration and byte counts.
 
-On Debian-based Linux distributions such as Kali Linux:
+HTTPS destination information is taken from the `CONNECT` request; encrypted HTTP request details are not logged. Log writes are serialized with a mutex. File-open failures do not stop console logging, and log rotation is not implemented.
+
+### Aggregate Statistics
+
+`ProxyStatistics` tracks total and active connections, HTTP and HTTPS connection counts, successful and failed connections, transferred bytes, and accumulated duration. Aggregate byte and duration totals are updated when a connection finishes.
+
+Byte counts combine both sides of a proxied connection: received bytes include reads from clients and upstream servers, and sent bytes include writes to both. These are application-level I/O counts, not a measurement of unique payload bytes or total network traffic.
+
+`ProxyServer::printStatistics()` formats and logs the summary, and the server destructor calls it after joining workers. There is currently no periodic reporting, dashboard, or graceful signal handler. Normal termination with Ctrl+C does not invoke that destructor, so it should not be expected to print a final summary.
+
+## Manual Testing
+
+Start the proxy in one terminal, then run these commands in another:
 
 ```bash
-sudo apt update
-sudo apt install g++ cmake
+# HTTP forwarding
+curl --noproxy "" -v -x http://127.0.0.1:8080 http://example.com/
+
+# HTTPS tunneling
+curl --noproxy "" -v -x http://127.0.0.1:8080 https://example.com/
 ```
 
-## Building
+For HTTPS, curl should report a successful `CONNECT` response before negotiating TLS with the destination.
 
-Clone the repository:
+Run the local timeout regression checks with Python 3 after building:
 
 ```bash
-git clone git@github.com:sanjay3941/multithread-proxy.git
+python3 tests/test_timeouts.py build/cpp_proxy
 ```
 
-Enter the project directory:
+The checks use loopback fixtures, the configured timeout values, and a temporary log directory. They take a few minutes and do not require root access or external servers.
 
-```bash
-cd multithread-proxy
-```
+To test from another device on a reachable network, configure its manual HTTP proxy with the Linux machine's reachable IPv4 address and the selected listening port. The device must support the proxy setting, and the host firewall must allow that connection.
 
-Create a build directory:
-
-```bash
-mkdir build
-cd build
-```
-
-Generate the build files:
-
-```bash
-cmake ..
-```
-
-Build the project:
-
-```bash
-make -j
-```
-
-The executable will be generated as:
-
-```text
-build/cpp_proxy
-```
-
-## Running
-
-Run the proxy with the default port:
-
-```bash
-./cpp_proxy
-```
-
-The default listening port is:
-
-```text
-8080
-```
-
-A custom port can also be specified:
-
-```bash
-./cpp_proxy 3128
-```
-
-The proxy listens on:
-
-```text
-0.0.0.0:8080
-```
-
-This allows clients on the local network to connect to the proxy.
-
-## Testing With curl
-
-HTTPS traffic can be tested using:
-
-```bash
-curl -4 -v -x http://127.0.0.1:8080 https://google.com
-```
-
-A successful connection should show the `CONNECT` request:
-
-```text
-CONNECT google.com:443 HTTP/1.1
-```
-
-followed by:
-
-```text
-HTTP/1.1 200 Connection Established
-```
-
-The TLS handshake then occurs through the established tunnel.
-
-## External Device Testing
-
-The proxy can also be tested using a smartphone or another device connected to the same network.
-
-Configure the device's manual proxy settings using the IP address of the Linux machine:
-
-```text
-Proxy Host: <Kali-IP>
-Proxy Port: 8080
-```
-
-For example:
-
-```text
-Proxy Host: 10.12.57.110
-Proxy Port: 8080
-```
-
-After configuring the proxy, HTTPS websites can be accessed through the C++ proxy.
-
-Multiple browser connections can be observed simultaneously on the proxy server.
-
-## Network Traffic Analysis
-
-Wireshark can be used to inspect traffic between the external client and the proxy.
-
-A useful display filter is:
+For packet inspection in Wireshark, filter on the selected port, for example:
 
 ```text
 tcp.port == 8080
 ```
 
-Traffic from a specific client can be filtered using:
-
-```text
-ip.addr == <client-ip>
-```
-
-For HTTPS connections, Wireshark can show information such as:
-
-- Client and proxy IP addresses
-- TCP connections
-- TCP ports
-- TCP packet flow
-- TLS handshake
-- TLS version
-- TLS application data
-- Server Name Indication (SNI), when available
-
-The HTTPS application data remains encrypted because the proxy implements tunneling rather than TLS interception.
+Packet captures can show TCP connections, the initial `CONNECT` exchange, and TLS records. HTTPS application contents remain encrypted.
 
 ## Error Handling
 
-The proxy returns appropriate HTTP error responses for common failures.
+Before a response begins, the client handler returns `408 Request Timeout` for client header/body timeouts, `504 Gateway Timeout` for upstream timeouts, `400 Bad Request` for invalid arguments, and `502 Bad Gateway` for other caught connection errors. Send failures while returning error responses are suppressed.
 
-### 400 Bad Request
+Read, write, and tunnel idle timeouts are logged as failures and counted as failed connections. Once an HTTP response or CONNECT tunnel has started, a failure closes the connection without injecting another HTTP response into the stream.
 
-Returned when the client sends a malformed or invalid request that cannot be parsed or validated.
+## Project Structure
 
-### 502 Bad Gateway
-
-Returned when the proxy cannot establish or communicate with the upstream destination server.
-
-## Socket Management
-
-The project includes a custom `network::Socket` abstraction.
-
-The socket wrapper follows RAII principles so that socket file descriptors are automatically closed when their owning objects are destroyed.
-
-The socket abstraction is move-only, allowing ownership to be transferred without accidentally duplicating socket ownership.
-
-## HTTP Processing
-
-The HTTP parser extracts:
-
-- Request method
-- Host
-- Port
-- Path
-- HTTP version
-- Headers
-
-Proxy-style requests such as:
-
-```http
-GET http://example.com/index.html HTTP/1.1
-Host: example.com
+```text
+multithread-proxy/
+|-- CMakeLists.txt
+|-- README.md
+|-- include/
+|   |-- http/http_parser.hpp
+|   |-- logging/logger.hpp
+|   |-- logging/statistics.hpp
+|   |-- network/socket.hpp
+|   |-- proxy/client_handler.hpp
+|   |-- proxy/proxy_server.hpp
+|   `-- proxy/timeouts.hpp
+|-- src/
+|   |-- main.cpp
+|   |-- http/http_parser.cpp
+|   |-- logging/logger.cpp
+|   |-- logging/statistics.cpp
+|   |-- network/socket.cpp
+|   |-- proxy/client_handler.cpp
+|   `-- proxy/proxy_server.cpp
+|-- build/                    # Generated build files and executable
+|-- tests/test_timeouts.py     # Local timeout regression checks
+`-- logs/                     # Runtime logs when started from the repository root
 ```
-
-are converted into origin-form requests before being forwarded:
-
-```http
-GET /index.html HTTP/1.1
-Host: example.com
-```
-
-Proxy-specific headers are removed before forwarding the request upstream.
-
-## HTTPS Processing
-
-HTTPS is handled using the standard HTTP `CONNECT` mechanism.
-
-The proxy establishes a TCP connection to the requested destination and then forwards data in both directions.
-
-The proxy does not perform TLS interception or man-in-the-middle decryption.
-
-Therefore, the proxy does not directly inspect:
-
-- HTTPS page contents
-- HTTP paths inside the TLS connection
-- Cookies
-- Passwords
-- Encrypted application data
-
-This implementation focuses on transparent HTTPS tunneling.
 
 ## Current Limitations
 
-The current implementation has the following limitations:
-
-- HTTP connections handle one request/response before closing.
-- Chunked HTTP request-body forwarding is not implemented.
-- IPv6 is not currently supported.
-- No proxy authentication.
-- No domain filtering.
-- No caching.
-- No rate limiting.
-- No traffic dashboard.
-- No TLS interception.
-- No graceful signal-based shutdown.
-- Thread-per-client architecture is not optimized for very large numbers of simultaneous connections.
-
-
-## Technologies
-
-- C++17
-- POSIX TCP Sockets
-- `std::thread`
-- CMake
-- Linux
-- HTTP/1.1
-- HTTPS CONNECT
-- TLS
-- Wireshark
-- Git
-- GitHub
-
-
-## Repository
-
-GitHub repository:
-
-https://github.com/sanjay3941/multithread-proxy
+- One HTTP request and response per client connection.
+- No chunked request-body forwarding or complete HTTP/1.1 compatibility.
+- No IPv6 listener, although outbound connections can use IPv6.
+- No proxy authentication, destination filtering, caching, or rate limiting.
+- No active-connection limits; each connection uses a worker thread.
+- DNS resolution is not covered by the TCP connection timeout.
+- No graceful signal-based shutdown or periodic statistics reporting.
+- No TLS interception, log rotation, or traffic dashboard.
 
 ## Author
 
-**Sanjay Viswaq**
+Sanjay Viswaq
+B.Tech Computer Science and Engineering, Cybersecurity Specialization
 
-B.Tech Computer Science and Engineering  
-Cybersecurity Specialization
+Repository: [sanjay3941/multithread-proxy](https://github.com/sanjay3941/multithread-proxy)

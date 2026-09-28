@@ -2,9 +2,13 @@
 
 #include "http/http_parser.hpp"
 #include "logging/logger.hpp"
+#include "proxy/timeouts.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <poll.h>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -15,14 +19,47 @@ namespace {
 
 constexpr std::size_t bufferSize = 16 * 1024;
 
+using Clock = std::chrono::steady_clock;
+
+class RequestTimeout : public network::TimeoutError {
+public:
+    using network::TimeoutError::TimeoutError;
+};
+
+bool timedOut() {
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
+}
+
+// Retain the same deadline when a signal interrupts poll().
+bool waitForData(pollfd* sockets, nfds_t count, Clock::time_point deadline) {
+    for (;;) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count();
+        if (remaining <= 0) return false;
+        const int result = ::poll(sockets, count, static_cast<int>(remaining));
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) throw std::runtime_error("socket poll failed");
+        if (result == 0) continue;
+        return true;
+    }
+}
+
 std::pair<std::string, std::string> readHeaders(
     network::Socket& socket, const std::shared_ptr<logging::ConnectionStats>& stats) {
     std::string data;
     std::vector<char> buffer(bufferSize);
+    const auto deadline = Clock::now() + std::chrono::seconds(timeouts::CLIENT_HEADER_TIMEOUT);
     while (data.find("\r\n\r\n") == std::string::npos) {
+        pollfd ready{socket.nativeHandle(), POLLIN, 0};
+        if (!waitForData(&ready, 1, deadline)) {
+            throw RequestTimeout("client header deadline exceeded");
+        }
         const auto count = socket.receive(buffer.data(), buffer.size());
         if (count == 0) throw std::runtime_error("client disconnected before request");
-        if (count < 0) throw std::runtime_error("client receive failed");
+        if (count < 0) {
+            if (timedOut()) throw RequestTimeout("client header read timed out");
+            throw std::runtime_error("client receive failed");
+        }
         data.append(buffer.data(), static_cast<std::size_t>(count));
         stats->bytesReceived.fetch_add(static_cast<std::uint64_t>(count));
         if (data.size() > 1024 * 1024) throw std::runtime_error("HTTP headers too large");
@@ -32,36 +69,32 @@ std::pair<std::string, std::string> readHeaders(
 }
 
 void relay(network::Socket& source, network::Socket& destination,
-           const std::shared_ptr<logging::ConnectionStats>& stats, int* responseStatus = nullptr,
-           const char* disconnectEvent = nullptr) {
+           const std::shared_ptr<logging::ConnectionStats>& stats, bool& responseStarted) {
     std::vector<char> buffer(bufferSize);
     for (;;) {
         const auto count = source.receive(buffer.data(), buffer.size());
-        if (count <= 0) {
-            if (disconnectEvent != nullptr) {
-                logging::Logger::instance().log(logging::LogLevel::INFO,
-                    "[" + stats->connectionId + "] STATUS=" + disconnectEvent);
-            }
+        if (count < 0) {
+            if (timedOut()) throw network::TimeoutError("upstream read timed out");
+            throw std::runtime_error("upstream receive failed");
+        }
+        if (count == 0) {
+            if (!responseStarted) throw std::runtime_error("upstream closed before response");
+            logging::Logger::instance().log(logging::LogLevel::INFO,
+                "[" + stats->connectionId + "] STATUS=UPSTREAM_DISCONNECTED");
             break;
         }
         stats->bytesReceived.fetch_add(static_cast<std::uint64_t>(count));
-        try {
-            destination.sendAll(buffer.data(), static_cast<std::size_t>(count));
-            stats->bytesSent.fetch_add(static_cast<std::uint64_t>(count));
-            if (responseStatus != nullptr && *responseStatus == 0) {
-                const std::string response(buffer.data(), static_cast<std::size_t>(count));
-                const auto lineEnd = response.find("\r\n");
-                if (lineEnd != std::string::npos) {
-                    std::istringstream statusLine(response.substr(0, lineEnd));
-                    std::string version;
-                    statusLine >> version >> *responseStatus;
-                }
+        responseStarted = true;
+        destination.sendAll(buffer.data(), static_cast<std::size_t>(count));
+        stats->bytesSent.fetch_add(static_cast<std::uint64_t>(count));
+        if (stats->httpStatus == 0) {
+            const std::string response(buffer.data(), static_cast<std::size_t>(count));
+            const auto lineEnd = response.find("\r\n");
+            if (lineEnd != std::string::npos) {
+                std::istringstream statusLine(response.substr(0, lineEnd));
+                std::string version;
+                statusLine >> version >> stats->httpStatus;
             }
-        } catch (const std::exception& error) {
-            logging::Logger::instance().log(logging::LogLevel::ERROR,
-                "[" + stats->connectionId + "] STATUS=FAILED ERROR=FORWARDING_ERROR MESSAGE=" +
-                error.what());
-            break;
         }
     }
     destination.shutdown();
@@ -75,12 +108,39 @@ ClientHandler::ClientHandler(network::Socket client,
 
 void ClientHandler::run() noexcept {
     bool successful = false;
+    const auto fail = [this](int status, const char* reason, const char* code,
+                             const std::exception& error) {
+        stats_->status = "FAILED";
+        stats_->errorCode = code;
+        stats_->errorMessage = error.what();
+        if (!responseStarted_) stats_->httpStatus = status;
+        logging::Logger::instance().log(logging::LogLevel::ERROR,
+            "[" + stats_->connectionId + "] PROTOCOL=" + stats_->protocol +
+            " STATUS=FAILED HTTP_STATUS=" + std::to_string(stats_->httpStatus) +
+            " ERROR=" + code + " MESSAGE=" + error.what());
+        // An HTTP response or CONNECT tunnel already in progress cannot receive
+        // a second HTTP status line. Close it after recording the failure.
+        if (!responseStarted_) {
+            try {
+                const std::string response = "HTTP/1.1 " + std::to_string(status) + " " + reason +
+                    "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                client_.sendAll(response.data(), response.size());
+                stats_->bytesSent.fetch_add(response.size());
+            } catch (...) {}
+        }
+    };
     try {
         stats_->threadId = [] {
             std::ostringstream output;
             output << std::this_thread::get_id();
             return output.str();
         }();
+
+        // Header reading also enforces an absolute deadline; this receive
+        // timeout remains in effect for subsequent HTTP request-body reads.
+        client_.setReceiveTimeout(timeouts::CLIENT_HEADER_TIMEOUT);
+        client_.setSendTimeout(timeouts::SOCKET_WRITE_TIMEOUT);
+
         const auto request = readHeaders(client_, stats_);
         logging::Logger::instance().log(logging::LogLevel::INFO,
             "[" + stats_->connectionId + "] CLIENT=" + stats_->clientIp + ":" +
@@ -100,36 +160,14 @@ void ClientHandler::run() noexcept {
             handleHttp(request.first, request.second, parsed);
         }
         successful = true;
+    } catch (const RequestTimeout& error) {
+        fail(408, "Request Timeout", "CLIENT_TIMEOUT", error);
+    } catch (const network::TimeoutError& error) {
+        fail(504, "Gateway Timeout", "TIMEOUT", error);
     } catch (const std::invalid_argument& error) {
-        stats_->status = "FAILED";
-        stats_->errorCode = "INVALID_REQUEST";
-        stats_->errorMessage = error.what();
-        stats_->httpStatus = 400;
-        logging::Logger::instance().log(logging::LogLevel::ERROR,
-            "[" + stats_->connectionId + "] PROTOCOL=" + stats_->protocol +
-            " STATUS=FAILED HTTP_STATUS=400 ERROR=INVALID_REQUEST MESSAGE=" + error.what());
-        try {
-            const std::string response = "HTTP/1.1 400 Bad Request\r\n"
-                                         "Connection: close\r\nContent-Length: 0\r\n\r\n";
-            client_.sendAll(response.data(), response.size());
-            stats_->bytesSent.fetch_add(response.size());
-        } catch (...) {
-        }
+        fail(400, "Bad Request", "INVALID_REQUEST", error);
     } catch (const std::exception& error) {
-        stats_->status = "FAILED";
-        stats_->errorCode = "UPSTREAM_CONNECTION_FAILED";
-        stats_->errorMessage = error.what();
-        stats_->httpStatus = 502;
-        logging::Logger::instance().log(logging::LogLevel::ERROR,
-            "[" + stats_->connectionId + "] PROTOCOL=" + stats_->protocol +
-            " STATUS=FAILED HTTP_STATUS=502 ERROR=UPSTREAM_CONNECTION_FAILED MESSAGE=" + error.what());
-        try {
-            const std::string response = "HTTP/1.1 502 Bad Gateway\r\n"
-                                         "Connection: close\r\nContent-Length: 0\r\n\r\n";
-            client_.sendAll(response.data(), response.size());
-            stats_->bytesSent.fetch_add(response.size());
-        } catch (...) {
-        }
+        fail(502, "Bad Gateway", "CONNECTION_FAILED", error);
     }
     stats_->status = successful ? "COMPLETED" : "FAILED";
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -147,7 +185,15 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTING");
-    auto remote = network::Socket::connectTo(parsed.host, parsed.port);
+
+    // Connect to upstream with a bounded timeout.
+    auto remote = network::Socket::connectTo(parsed.host, parsed.port,
+                                             timeouts::UPSTREAM_CONNECT_TIMEOUT);
+
+    // Bound how long we wait for the upstream server to respond.
+    remote.setReceiveTimeout(timeouts::UPSTREAM_READ_TIMEOUT);
+    remote.setSendTimeout(timeouts::SOCKET_WRITE_TIMEOUT);
+
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTED");
@@ -186,13 +232,14 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
     std::vector<char> buffer(bufferSize);
     while (remaining > 0) {
         const auto count = client_.receive(buffer.data(), std::min(buffer.size(), remaining));
+        if (count < 0 && timedOut()) throw RequestTimeout("client request body timed out");
         if (count <= 0) throw std::runtime_error("client disconnected during request body");
         stats_->bytesReceived.fetch_add(static_cast<std::uint64_t>(count));
         remote.sendAll(buffer.data(), static_cast<std::size_t>(count));
         stats_->bytesSent.fetch_add(static_cast<std::size_t>(count));
         remaining -= static_cast<std::size_t>(count);
     }
-    relay(remote, client_, stats_, &stats_->httpStatus, "UPSTREAM_DISCONNECTED");
+    relay(remote, client_, stats_, responseStarted_);
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] STATUS=HTTP_RESPONSE_RECEIVED HTTP_STATUS=" +
         std::to_string(stats_->httpStatus));
@@ -203,11 +250,18 @@ void ClientHandler::handleConnect(const std::string&, const std::string& buffere
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTING");
-    auto remote = network::Socket::connectTo(parsed.host, parsed.port);
+
+    // Connect to upstream with a bounded timeout.
+    auto remote = network::Socket::connectTo(parsed.host, parsed.port,
+                                             timeouts::UPSTREAM_CONNECT_TIMEOUT);
+
+    remote.setSendTimeout(timeouts::SOCKET_WRITE_TIMEOUT);
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTED");
     const std::string established = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    responseStarted_ = true;
+    stats_->httpStatus = 200;
     client_.sendAll(established.data(), established.size());
     stats_->bytesSent.fetch_add(established.size());
     if (!buffered.empty()) {
@@ -218,15 +272,34 @@ void ClientHandler::handleConnect(const std::string&, const std::string& buffere
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=TUNNEL_ESTABLISHED");
 
-    std::thread clientToServer([this, &remote] {
-        relay(client_, remote, stats_, nullptr, "CLIENT_DISCONNECTED");
-    });
-    std::thread serverToClient([this, &remote] {
-        relay(remote, client_, stats_, nullptr, "UPSTREAM_DISCONNECTED");
-    });
-    clientToServer.join();
-    remote.shutdown();
-    serverToClient.join();
+    // One worker watches both directions so activity on either side keeps the
+    // tunnel alive. Blocking sends have their own bounded timeout.
+    pollfd sockets[] = {{client_.nativeHandle(), POLLIN, 0},
+                        {remote.nativeHandle(), POLLIN, 0}};
+    std::vector<char> buffer(bufferSize);
+    auto deadline = Clock::now() + std::chrono::seconds(timeouts::HTTPS_TUNNEL_IDLE_TIMEOUT);
+    for (;;) {
+        if (!waitForData(sockets, 2, deadline)) {
+            throw network::TimeoutError("tunnel idle timeout");
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (sockets[i].revents == 0) continue;
+            auto& source = i == 0 ? client_ : remote;
+            auto& destination = i == 0 ? remote : client_;
+            const auto count = source.receive(buffer.data(), buffer.size());
+            if (count < 0) throw std::runtime_error("tunnel receive failed");
+            if (count == 0) {
+                logging::Logger::instance().log(logging::LogLevel::INFO,
+                    "[" + stats_->connectionId + "] STATUS=" +
+                    (i == 0 ? "CLIENT_DISCONNECTED" : "UPSTREAM_DISCONNECTED"));
+                return;
+            }
+            stats_->bytesReceived.fetch_add(static_cast<std::uint64_t>(count));
+            destination.sendAll(buffer.data(), static_cast<std::size_t>(count));
+            stats_->bytesSent.fetch_add(static_cast<std::uint64_t>(count));
+            deadline = Clock::now() + std::chrono::seconds(timeouts::HTTPS_TUNNEL_IDLE_TIMEOUT);
+        }
+    }
 }
 
 } // namespace proxy

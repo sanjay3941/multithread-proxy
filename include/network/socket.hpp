@@ -4,9 +4,15 @@
 #include <cstdint>
 #include <sys/types.h>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 namespace network {
+
+class TimeoutError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Socket {
 public:
@@ -20,7 +26,10 @@ public:
     Socket& operator=(Socket&& other) noexcept;
 
     static Socket createTcp();
-    static Socket connectTo(const std::string& host, const std::string& port);
+    /// Connects to host:port. If connectTimeoutSeconds > 0, the TCP handshake
+    /// is bounded by that many seconds; throws on timeout or refusal.
+    static Socket connectTo(const std::string& host, const std::string& port,
+                            int connectTimeoutSeconds = 0);
 
     void bindAndListen(const std::string& host, std::uint16_t port,
                        int backlog = 128);
@@ -29,6 +38,12 @@ public:
 
     std::size_t sendAll(const void* data, std::size_t length) const;
     ssize_t receive(void* buffer, std::size_t length) const;
+
+    /// Sets SO_RCVTIMEO: receive() will return -1/EAGAIN after this many seconds.
+    void setReceiveTimeout(int seconds);
+    /// Sets SO_SNDTIMEO: sendAll() will throw after this many seconds of blocking.
+    void setSendTimeout(int seconds);
+
     void shutdown();
     void close() noexcept;
     bool isOpen() const noexcept;

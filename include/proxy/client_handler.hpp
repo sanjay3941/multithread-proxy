@@ -21,6 +21,7 @@ private:
                        const http::HttpRequest& parsed);
     network::Socket client_;
     std::shared_ptr<logging::ConnectionStats> stats_;
+    bool responseStarted_ = false;
 };
 
 } // namespace proxy
