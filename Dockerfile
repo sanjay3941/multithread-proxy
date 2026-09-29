@@ -1,34 +1,64 @@
 # syntax=docker/dockerfile:1
-# ---- Stage 1: build the proxy ----
-FROM ubuntu:24.04 AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential cmake ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY . .
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build --parallel 1
 
-# ---- Stage 2: runtime image (proxy + wstunnel) ----
-FROM ubuntu:24.04
+# ==============================================================================
+# Stage 1: Build the C++ Forward Proxy and Download wstunnel
+# ==============================================================================
+FROM ubuntu:24.04 AS builder
+
 ARG WSTUNNEL_VERSION=10.7.1
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
- && curl -fsSL "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_amd64.tar.gz" \
-    | tar -xz -C /usr/local/bin wstunnel \
- && chmod +x /usr/local/bin/wstunnel \
- && apt-get purge -y curl \
- && apt-get autoremove -y \
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ca-certificates \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
+# Download pinned wstunnel binary
+RUN curl -fsSL "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_amd64.tar.gz" \
+    | tar -xz -C /tmp \
+ && chmod +x /tmp/wstunnel
+
+# Build cpp_proxy from source using CMake
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY include/ include/
+COPY src/ src/
+
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build --parallel
+
+# ==============================================================================
+# Stage 2: Production Runtime Image
+# ==============================================================================
+FROM ubuntu:24.04
+
+# Runtime requirements: ca-certificates for outbound TLS, bash for supervisor
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    bash \
+ && rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged application user
 RUN useradd --system --create-home --home-dir /app appuser
+
 WORKDIR /app
-COPY --from=build /src/build/cpp_proxy /app/cpp_proxy
+
+# Copy binaries from builder stage
+COPY --from=builder /tmp/wstunnel /usr/local/bin/wstunnel
+COPY --from=builder /src/build/cpp_proxy /app/cpp_proxy
 COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh \
+
+# Set executable permissions and create logging directory
+RUN chmod +x /usr/local/bin/wstunnel /app/cpp_proxy /app/start.sh \
  && mkdir -p /app/logs \
  && chown -R appuser:appuser /app
+
 USER appuser
 
-# Render sets $PORT; only that port is public. The proxy stays on 127.0.0.1:8080 side.
-CMD ["/app/start.sh"]
+# Render supplies the public web service port through $PORT.
+ENV PORT=10000
+EXPOSE 10000
+
+ENTRYPOINT ["/app/start.sh"]

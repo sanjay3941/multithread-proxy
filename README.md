@@ -245,6 +245,222 @@ tcp.port == 8080
 
 Packet captures can show TCP connections, the initial `CONNECT` exchange, and TLS records. HTTPS application contents remain encrypted.
 
+## Docker + Render Deployment
+
+This section describes deploying the proxy to [Render](https://render.com) using a containerized `wstunnel` transport bridge.
+
+### Architecture
+
+Render Web Services expose HTTP/HTTPS and WebSocket endpoints; they do not route arbitrary inbound raw TCP traffic to containers. To host the native C++ TCP forward proxy on Render without altering its socket architecture, `wstunnel` is used strictly as an encrypted L4 WebSocket transport layer.
+
+```text
+Local Windows Machine:
+  [ Browser / curl ]
+          |
+          | TCP (http://127.0.0.1:8080)
+          v
+  [ wstunnel Client (v10.7.1) ]
+          |
+          | WSS (WebSocket over TLS / Port 443)
+          v
+Render Cloud:
+  [ Render Web Service Edge / TLS Termination ]
+          |
+          | Cleartext WebSocket ($PORT)
+          v
+  [ Docker Container ]
+    +-------------------------------------------------------------+
+    |                                                             |
+    |  [ wstunnel Server (v10.7.1) ]                              |
+    |         | (Loopback TCP forwarding)                         |
+    |         v                                                   |
+    |  [ cpp_proxy (Internal Port 18080) ]                        |
+    |         |                                                   |
+    +---------|---------------------------------------------------+
+              | Outbound TCP (HTTP / HTTPS CONNECT)
+              v
+       [ Internet Origin Servers ]
+```
+
+#### Core Design Guarantees
+
+- **`wstunnel` is strictly a transport bridge:** It encapsulates raw TCP stream bytes inside WebSocket frames over TLS and decapsulates them inside the container. It does not parse or modify HTTP/HTTPS proxy payloads.
+- **`cpp_proxy` remains the active forward proxy:** All HTTP parsing, validation, in-memory caching, request forwarding, statistics tracking, and HTTPS `CONNECT` tunnels are handled natively by `cpp_proxy`.
+- **Zero TLS termination by proxy:** For HTTPS `CONNECT` tunnels, end-to-end TLS encryption between client and origin destination is completely preserved.
+- **Zero public TCP exposure:** `cpp_proxy` listens exclusively on `127.0.0.1:18080` inside the container. It cannot be accessed directly from the public internet.
+- **Strong tunnel authentication:** Access to the `wstunnel` server is protected by `TUNNEL_SECRET` using path-prefix restriction. Unauthenticated connections are rejected immediately with `HTTP 400 Bad Request`.
+- **Destination lockdown:** The `wstunnel` server is locked with `--restrict-to 127.0.0.1:18080`, preventing attackers from using the tunnel to relay traffic to arbitrary internal or external hosts.
+
+---
+
+### Render Web Service Configuration
+
+Configure a new Web Service in the Render Dashboard:
+
+| Setting | Value |
+| --- | --- |
+| **Language / Environment** | `Docker` |
+| **Repository** | Your Git repository |
+| **Branch** | `main` |
+| **Dockerfile Path** | `./Dockerfile` |
+| **Docker Context** | `.` |
+| **Instance Type** | Free or Starter |
+
+#### Required Environment Variables
+
+Set the following in **Environment** > **Environment Variables** in the Render Dashboard:
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `TUNNEL_SECRET` | **Yes** | *None* | Shared secret string for WebSocket authentication. Must be kept confidential and never committed to version control. |
+| `PORT` | Auto-injected | `10000` | Public port assigned by Render. The `wstunnel` server binds to `0.0.0.0:$PORT`. |
+| `INTERNAL_PORT` | No | `18080` | Internal loopback TCP port on which `cpp_proxy` listens. |
+| `PROXY_WORKERS` | No | `8` | Number of worker threads for the `cpp_proxy` thread pool. |
+| `PROXY_QUEUE` | No | `32` | Maximum pending connection queue depth for `cpp_proxy`. |
+
+Generate a strong random secret using:
+```bash
+openssl rand -hex 24
+```
+
+---
+
+### Container Process Supervision (`start.sh`)
+
+The container entrypoint `/app/start.sh` concurrently launches and supervises both processes:
+1. Validates that `TUNNEL_SECRET` is present; exits with an informative error message if missing.
+2. Starts `cpp_proxy` bound to `127.0.0.1:$INTERNAL_PORT`.
+3. Starts `wstunnel server` on `0.0.0.0:$PORT` with `--restrict-to 127.0.0.1:$INTERNAL_PORT` and `--restrict-http-upgrade-path-prefix "$TUNNEL_SECRET"`.
+4. Traps `SIGTERM` and `SIGINT`:
+   - Sends `SIGINT` to `cpp_proxy` to trigger its graceful shutdown sequence (draining the queue, finishing active transfers within timeouts, joining workers, and logging aggregate statistics).
+   - Sends `SIGTERM` to `wstunnel server`.
+   - Waits for both processes to terminate cleanly before container exit.
+5. Monitors both child processes; if either process fails, `start.sh` terminates the remaining process and exits with the corresponding failure code so Render can restart the container.
+
+---
+
+### Local Windows Client Setup
+
+#### 1. Download wstunnel for Windows
+
+Download the pinned `v10.7.1` release for Windows:
+- Release archive: `wstunnel_10.7.1_windows_amd64.tar.gz`
+- URL: `https://github.com/erebe/wstunnel/releases/download/v10.7.1/wstunnel_10.7.1_windows_amd64.tar.gz`
+
+Extract `wstunnel.exe` to a local directory (for example, `C:\Tools\wstunnel\`).
+
+#### 2. Start the Windows wstunnel Client
+
+Open PowerShell or Command Prompt and run:
+
+```powershell
+wstunnel.exe client `
+  -L "tcp://127.0.0.1:8080:127.0.0.1:18080" `
+  -P "YOUR_TUNNEL_SECRET" `
+  "wss://your-service-name.onrender.com"
+```
+
+*Command breakdown:*
+- `-L tcp://127.0.0.1:8080:127.0.0.1:18080`: Listens locally on `127.0.0.1:8080` and routes incoming TCP connections through the tunnel to `127.0.0.1:18080` on the Render container.
+- `-P YOUR_TUNNEL_SECRET`: Specifies the secret HTTP upgrade path prefix required by the server's `--restrict-http-upgrade-path-prefix` configuration.
+- `wss://your-service-name.onrender.com`: Secure WebSocket endpoint terminating TLS at Render's edge.
+
+Once connected, your local machine exposes an HTTP/HTTPS forward proxy at `http://127.0.0.1:8080`.
+
+---
+
+### Verification and Testing Procedures
+
+Run these tests from another terminal on the local Windows machine while the `wstunnel` client is running:
+
+#### 1. HTTP Forwarding Test
+
+```bash
+curl --noproxy "" -v -x http://127.0.0.1:8080 http://example.com/
+```
+*Expected behavior:* The client receives `HTTP/1.1 200 OK`. `cpp_proxy` logs:
+`[REQ-XXXXXX] PROTOCOL=HTTP METHOD=GET TARGET=example.com:80 ... STATUS=COMPLETED`
+
+#### 2. HTTPS CONNECT Tunneling Test
+
+```bash
+curl --noproxy "" -v -x http://127.0.0.1:8080 https://example.com/
+```
+*Expected behavior:* Curl initiates `CONNECT example.com:443 HTTP/1.1`. `cpp_proxy` replies with `HTTP/1.1 200 Connection Established`. Curl performs TLS negotiation directly with `example.com` through the tunnel and receives the HTTPS response.
+
+#### 3. Egress IP Verification
+
+```bash
+curl --noproxy "" -x http://127.0.0.1:8080 https://ifconfig.me
+```
+*Expected behavior:* Returns the public egress IPv4 address of the Render container host, confirming the request originated from the cloud environment rather than the local client.
+
+#### 4. Security Verification Tests
+
+Verify that the proxy is inaccessible without proper credentials:
+
+- **Direct unauthenticated HTTP access:**
+  ```bash
+  curl -i https://your-service-name.onrender.com/
+  ```
+  *Expected behavior:* `wstunnel` rejects the request with `HTTP/1.1 400 Bad Request` (`Invalid protocol request`). `cpp_proxy` is not contacted.
+
+- **Incorrect tunnel secret:**
+  Run the client with an invalid secret:
+  ```powershell
+  wstunnel.exe client -L "tcp://127.0.0.1:8080:127.0.0.1:18080" -P "wrong_secret" "wss://your-service-name.onrender.com"
+  ```
+  *Expected behavior:* The WebSocket upgrade handshake fails with `Invalid status code: 400`. No tunnel is established.
+
+- **Destination restriction check:**
+  Attempting to route to any host other than `127.0.0.1:18080` (e.g. `-L tcp://127.0.0.1:8080:google.com:443`) is rejected by the server's `--restrict-to` policy.
+
+---
+
+### Expected Server Logs
+
+In the Render service dashboard logs, expected operational output includes:
+
+```text
+==================================================
+ Starting Multithreaded Proxy Container Services 
+==================================================
+[start.sh] Launching C++ proxy on internal port 127.0.0.1:18080 (workers=8, queue=32)...
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] POOL_STARTED WORKERS=8 QUEUE_CAPACITY=32
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] PROXY_LISTENING ADDRESS=0.0.0.0:18080
+[start.sh] cpp_proxy is running (PID ...).
+[start.sh] Launching wstunnel server on 0.0.0.0:10000 (forwarding to 127.0.0.1:18080)...
+INFO wstunnel::tunnel::server::server: Starting wstunnel server listening on 0.0.0.0:10000
+[start.sh] wstunnel server is running (PID ...).
+[start.sh] Ready to accept authenticated WebSocket connections via Render.
+INFO wstunnel::tunnel::server::server: Tunnel accepted due to matched restriction: Allow path prefix <SECRET>
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] [REQ-000001] CLIENT=127.0.0.1:... STATUS=ACCEPTED
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] [REQ-000001] PROTOCOL=HTTP METHOD=GET TARGET=example.com:80 ... STATUS=COMPLETED
+```
+
+On container shutdown (redeploy or service stop):
+```text
+[start.sh] Shutdown signal received. Initiating graceful shutdown...
+[start.sh] Sending SIGINT to cpp_proxy (PID ...)...
+[start.sh] Sending SIGTERM to wstunnel server (PID ...)...
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] SIGINT received, initiating graceful shutdown
+[YYYY-MM-DD HH:MM:SS.mmm] [INFO] [THREAD=...] ========== PROXY STATISTICS ==========
+Total Connections      : ...
+...
+[start.sh] cpp_proxy stopped cleanly.
+[start.sh] wstunnel server stopped.
+[start.sh] All container processes terminated.
+```
+
+---
+
+### Known Deployment Limitations
+
+- **Render Free Tier Spin-down:** Free tier web services spin down after 15 minutes of inactivity. When a new connection arrives, container cold-start takes approximately 30–50 seconds.
+- **Worker Occupancy during HTTPS Tunnels:** Each active HTTPS `CONNECT` tunnel occupies one worker thread in `cpp_proxy` for the tunnel's lifetime (governed by `HTTPS_TUNNEL_IDLE_TIMEOUT = 120s`). Size `PROXY_WORKERS` appropriately if expecting many concurrent persistent tunnels.
+- **WebSocket Transport Overhead:** Encapsulating TCP streams into WebSockets introduces minor latency and framing overhead compared to direct TCP.
+- **TCP Only:** The proxy architecture handles TCP-based protocols (HTTP/HTTPS); UDP-based protocols (e.g. QUIC / HTTP/3) are not tunneled by the HTTP forward proxy.
+
 ## Error Handling
 
 Before a response begins, the client handler returns `408 Request Timeout` for client header/body timeouts, `504 Gateway Timeout` for upstream timeouts, `400 Bad Request` for invalid arguments, and `502 Bad Gateway` for other caught connection errors. Send failures while returning error responses are suppressed.
@@ -256,6 +472,9 @@ Read, write, and tunnel idle timeouts are logged as failures and counted as fail
 ```text
 multithread-proxy/
 |-- CMakeLists.txt
+|-- Dockerfile
+|-- .dockerignore
+|-- start.sh
 |-- README.md
 |-- include/
 |   |-- http/http_parser.hpp

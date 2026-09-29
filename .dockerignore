@@ -1,6 +1,13 @@
-build/
-logs/
 .git/
 .gitignore
-*.md
+build/
+logs/
+*.log
 tests/
+*.md
+.vscode/
+.idea/
+*.swp
+*~
+tmp/
+scratch/
