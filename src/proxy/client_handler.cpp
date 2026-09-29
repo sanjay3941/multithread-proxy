@@ -2,12 +2,14 @@
 
 #include "http/http_parser.hpp"
 #include "logging/logger.hpp"
+#include "proxy/cache.hpp"
 #include "proxy/timeouts.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
@@ -29,6 +31,39 @@ public:
 bool timedOut() {
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
 }
+
+bool cacheableRequest(const http::HttpRequest& request) {
+    if (request.method != "GET") return false;
+    for (const auto& header : request.headers) {
+        const auto& name = header.first;
+        if (name == "authorization" || name == "proxy-authorization" ||
+            name == "cookie" || name == "range" || name == "upgrade" ||
+            name.rfind("if-", 0) == 0) return false;
+    }
+    const auto length = request.headers.find("content-length");
+    if (length != request.headers.end() && length->second != "0") return false;
+    const auto control = request.headers.find("cache-control");
+    if (control != request.headers.end()) {
+        std::string value = control->second;
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (value.find("no-cache") != std::string::npos ||
+            value.find("no-store") != std::string::npos ||
+            value.find("max-age=0") != std::string::npos) return false;
+    }
+    const auto pragma = request.headers.find("pragma");
+    if (pragma != request.headers.end() && pragma->second.find("no-cache") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+struct FlightDone {
+    Cache& cache;
+    const std::string& key;
+    std::shared_ptr<Cache::Flight> flight;
+    ~FlightDone() { cache.complete(key, flight); }
+};
 
 // Retain the same deadline when a signal interrupts poll().
 bool waitForData(pollfd* sockets, nfds_t count, Clock::time_point deadline) {
@@ -69,7 +104,8 @@ std::pair<std::string, std::string> readHeaders(
 }
 
 void relay(network::Socket& source, network::Socket& destination,
-           const std::shared_ptr<logging::ConnectionStats>& stats, bool& responseStarted) {
+           const std::shared_ptr<logging::ConnectionStats>& stats, bool& responseStarted,
+           std::string* captured = nullptr, bool* captureOverflow = nullptr) {
     std::vector<char> buffer(bufferSize);
     for (;;) {
         const auto count = source.receive(buffer.data(), buffer.size());
@@ -87,6 +123,15 @@ void relay(network::Socket& source, network::Socket& destination,
         responseStarted = true;
         destination.sendAll(buffer.data(), static_cast<std::size_t>(count));
         stats->bytesSent.fetch_add(static_cast<std::uint64_t>(count));
+        if (captured != nullptr && captureOverflow != nullptr && !*captureOverflow) {
+            if (captured->size() + static_cast<std::size_t>(count) <=
+                Cache::maxEntryBytes + 64 * 1024) {
+                captured->append(buffer.data(), static_cast<std::size_t>(count));
+            } else {
+                captured->clear();
+                *captureOverflow = true;
+            }
+        }
         if (stats->httpStatus == 0) {
             const std::string response(buffer.data(), static_cast<std::size_t>(count));
             const auto lineEnd = response.find("\r\n");
@@ -182,6 +227,50 @@ void ClientHandler::run() noexcept {
 
 void ClientHandler::handleHttp(const std::string& requestHead, const std::string& buffered,
                                const http::HttpRequest& parsed) {
+    auto& cache = Cache::instance();
+    const std::string key = parsed.host + ":" + parsed.port + parsed.path;
+    const bool simulation = std::getenv("PROXY_CACHE_SIMULATE") != nullptr &&
+        std::string(std::getenv("PROXY_CACHE_SIMULATE")) == "1";
+    const bool candidate = cacheableRequest(parsed) && buffered.empty();
+    const bool changesResource = parsed.method != "GET" && parsed.method != "HEAD" &&
+        parsed.method != "OPTIONS" && parsed.method != "TRACE";
+    if (changesResource) cache.invalidate(key);
+    const auto cacheLog = [this](const std::string& result) {
+        logging::Logger::instance().log(logging::LogLevel::INFO,
+            "[" + stats_->connectionId + "] CACHE=" + result);
+    };
+    Cache::Lookup lookup{Cache::Action::Cold, {}, nullptr};
+    if (candidate) {
+        lookup = cache.lookup(key, simulation);
+        if (lookup.action == Cache::Action::Hit) {
+            cacheLog("HIT BYTES_SAVED=" + std::to_string(lookup.response.size()));
+            responseStarted_ = true;
+            stats_->httpStatus = 200;
+            client_.sendAll(lookup.response.data(), lookup.response.size());
+            stats_->bytesSent.fetch_add(lookup.response.size());
+            return;
+        }
+        if (lookup.action == Cache::Action::Wait) {
+            std::string response;
+            if (cache.wait(key, lookup.flight, response)) {
+                cacheLog("COALESCED BYTES_SAVED=" + std::to_string(response.size()));
+                responseStarted_ = true;
+                stats_->httpStatus = 200;
+                client_.sendAll(response.data(), response.size());
+                stats_->bytesSent.fetch_add(response.size());
+                return;
+            }
+            cacheLog("COALESCE_FALLBACK");
+        } else if (lookup.action == Cache::Action::Cold) {
+            cacheLog("MISS REASON=BELOW_THRESHOLD");
+        } else {
+            cacheLog(simulation ? "SIMULATE_FETCH" : "MISS REASON=POPULAR");
+        }
+    } else {
+        cacheLog("BYPASS REASON=REQUEST_INELIGIBLE");
+    }
+    FlightDone flightDone{cache, key, lookup.action == Cache::Action::Fetch ? lookup.flight : nullptr};
+
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTING");
@@ -239,7 +328,30 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
         stats_->bytesSent.fetch_add(static_cast<std::size_t>(count));
         remaining -= static_cast<std::size_t>(count);
     }
-    relay(remote, client_, stats_, responseStarted_);
+    std::string captured;
+    bool captureOverflow = false;
+    const bool capture = candidate &&
+        (lookup.action == Cache::Action::Fetch || lookup.action == Cache::Action::Simulate);
+    relay(remote, client_, stats_, responseStarted_, capture ? &captured : nullptr,
+          capture ? &captureOverflow : nullptr);
+    if (capture) {
+        int initialAge = 0;
+        const int lifetime = captureOverflow ? 0 : Cache::eligibleLifetime(captured, initialAge);
+        if (lifetime > 0) {
+            if (simulation) {
+                cacheLog("WOULD_STORE BYTES=" + std::to_string(captured.size()));
+            } else {
+                if (cache.store(key, std::move(captured), lifetime, initialAge, lookup.flight)) {
+                    cacheLog("STORED TTL=" + std::to_string(lifetime));
+                } else {
+                    cacheLog("NOT_STORED REASON=INVALIDATED");
+                }
+            }
+        } else {
+            cacheLog("NOT_STORED REASON=RESPONSE_INELIGIBLE");
+        }
+    }
+    if (changesResource) cache.invalidate(key);
     logging::Logger::instance().log(logging::LogLevel::INFO,
         "[" + stats_->connectionId + "] STATUS=HTTP_RESPONSE_RECEIVED HTTP_STATUS=" +
         std::to_string(stats_->httpStatus));

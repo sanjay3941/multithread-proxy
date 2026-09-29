@@ -3,6 +3,7 @@
 #include "network/socket.hpp"
 #include "proxy/work_queue.hpp"
 
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -37,8 +38,13 @@ public:
     ProxyServer& operator=(const ProxyServer&) = delete;
 
     /// Runs the accept loop.  Blocks until accept() throws (e.g. when the
-    /// listener is closed during shutdown).
-    void start();
+    /// listener is closed or SIGINT interrupts the call with EINTR).
+    ///
+    /// \param shutdownFlag  Optional pointer to a volatile sig_atomic_t set by
+    ///                      a signal handler.  When non-null and non-zero after
+    ///                      an accept() failure, the failure is treated as a
+    ///                      graceful shutdown request rather than an error.
+    void start(const volatile sig_atomic_t* shutdownFlag = nullptr);
     void printStatistics() const;
 
 private:

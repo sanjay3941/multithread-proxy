@@ -12,6 +12,7 @@ add_executable(cpp_proxy
     src/logging/logger.cpp
     src/logging/statistics.cpp
     src/proxy/work_queue.cpp
+    src/proxy/cache.cpp
     src/proxy/client_handler.cpp
     src/proxy/proxy_server.cpp
 )

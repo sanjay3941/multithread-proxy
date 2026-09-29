@@ -42,6 +42,10 @@ ProxyServer::~ProxyServer() {
 //      their current connection (bounded by the configured timeouts) before
 //      joining, so active connections are not forcibly interrupted.
 //   5. Print aggregate statistics.
+//
+// After stop() returns, main() returns and static destructors run.
+// Cache::~Cache() is called during static destruction; it sets stopping_,
+// signals the housekeeping CV, and joins the janitor thread.
 void ProxyServer::stop() {
     listener_.close();
     queue_.stop();
@@ -63,7 +67,7 @@ void ProxyServer::stop() {
 // REQ-* entries.
 //
 // HTTPS CONNECT forwards both directions with poll() in this worker.
-// A tunnel occupies one worker until the connection closes.
+// A tunnel occupies one worker until the connection closes or the idle timeout fires.
 void ProxyServer::workerLoop() {
     WorkItem item;
     while (queue_.pop(item)) {
@@ -75,7 +79,13 @@ void ProxyServer::workerLoop() {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-void ProxyServer::start() {
+// shutdownFlag is a pointer to the volatile sig_atomic_t written by the
+// SIGINT handler in main.cpp.  The handler is installed without SA_RESTART,
+// so SIGINT interrupts accept() with EINTR rather than restarting it.
+// socket.cpp::accept() does not retry EINTR, so the exception is thrown
+// immediately.  The catch block below inspects the flag to distinguish a
+// graceful shutdown from a genuine accept() error.
+void ProxyServer::start(const volatile sig_atomic_t* shutdownFlag) {
     listener_ = network::Socket::createTcp();
     listener_.bindAndListen(bindAddress_, port_);
     logging::Logger::instance().log(logging::LogLevel::INFO,
@@ -101,10 +111,18 @@ void ProxyServer::start() {
                 logging::ProxyStatistics::instance().finish(stats, /*successful=*/false);
             }
         } catch (const std::exception& error) {
-            // accept() throws when the listener fd is closed (during stop())
-            // or on a transient OS error.  Either way we exit the loop.
-            logging::Logger::instance().log(logging::LogLevel::ERROR,
-                std::string("ACCEPT_FAILURE ERROR=") + error.what());
+            if (shutdownFlag && *shutdownFlag) {
+                // SIGINT interrupted accept().  Log the graceful shutdown
+                // message from normal program flow (not from the signal handler)
+                // then exit the loop.  The existing stop() path runs in the
+                // destructor: queue drained, workers joined, stats printed.
+                logging::Logger::instance().log(logging::LogLevel::INFO,
+                    "SIGINT received, initiating graceful shutdown");
+            } else {
+                // Genuine accept() failure — log as error and exit.
+                logging::Logger::instance().log(logging::LogLevel::ERROR,
+                    std::string("ACCEPT_FAILURE ERROR=") + error.what());
+            }
             break;
         }
     }

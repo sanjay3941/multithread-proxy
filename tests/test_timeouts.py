@@ -240,7 +240,11 @@ if __name__ == '__main__':
     failures = []
     print('Logs: ' + str(work), flush=True)
     with (work / 'console.log').open('w') as output:
-        proxy = subprocess.Popen([str(binary), str(proxy_port)], cwd=work, stdout=output, stderr=output)
+        # Every case runs concurrently and some intentionally occupy a worker
+        # for a full timeout. Give each case its own worker so queueing does
+        # not distort the timing assertions.
+        proxy = subprocess.Popen([str(binary), str(proxy_port), str(len(tests))],
+                                 cwd=work, stdout=output, stderr=output)
         try:
             for _ in range(50):
                 if proxy.poll() is not None:
