@@ -8,7 +8,7 @@ A C++17 forward proxy for Linux and POSIX environments, implemented with TCP soc
 - Request-body forwarding based on `Content-Length`.
 - HTTPS tunneling with bidirectional TCP forwarding.
 - A fixed worker thread pool with a bounded, thread-safe connection queue.
-- An optional in-memory cache for popular, explicitly public HTTP responses.
+- An in-memory cache for popular, explicitly public HTTP responses.
 - Move-only RAII socket ownership and automatic descriptor cleanup.
 - Connection lifecycle logging to the console and a log file.
 - Per-connection byte counts, duration, destination, and status tracking.
@@ -89,11 +89,11 @@ Each HTTP connection handles one request and response. Persistent client connect
 
 ### HTTP Cache
 
-The proxy observes requests for each full HTTP URL (host, port, path, and query). After the same URL is requested three times within five minutes, it captures the next eligible upstream response. Later requests can be served from memory while that response is fresh. Concurrent requests for a popular URL wait briefly for one in-progress fetch, avoiding duplicate origin requests when that response can be stored. If it cannot be stored or the wait exceeds 15 seconds, those requests fetch normally.
+The proxy observes requests for each full HTTP URL (host, port, path, and query). On the third request for the same URL within five minutes, it can capture an eligible upstream response. Later requests can be served from memory while that response is fresh. Concurrent requests for a popular URL wait briefly for one in-progress fetch, avoiding duplicate origin requests when that response can be stored. If it cannot be stored or the wait exceeds 15 seconds, those requests fetch normally.
 
 Only complete `200 OK` responses with `Content-Length` and explicit `Cache-Control: public, max-age=N` are stored. Requests with credentials, cookies, ranges, conditions, request bodies, or cache bypass directives are forwarded without caching. Responses with `private`, `no-store`, `no-cache`, `Set-Cookie`, `Vary`, `Transfer-Encoding`, or `Age` are not stored. The cache also rejects incomplete and oversized responses. Unsafe methods such as POST invalidate a cached response for the matching URL.
 
-Entries expire according to `max-age`, capped at ten minutes, and are removed after ten minutes without access. A housekeeping thread removes idle entries at least once a minute. Memory is limited to 1 MiB per response and 16 MiB overall; least recently used entries are evicted when necessary. Demand tracking is limited to 4,096 URLs. Cache hits include an `Age` response header. Decisions such as `MISS`, `HIT`, `COALESCED`, `STORED`, and `BYPASS` appear in `logs/proxy.log` under the connection ID.
+Entries expire according to `max-age`, capped at ten minutes, and are removed after ten minutes without access. A housekeeping thread checks for expired and idle entries once a minute. Memory is limited to 1 MiB per response and 16 MiB overall; least recently used entries are evicted when necessary. Demand tracking is limited to 4,096 URLs. Cache hits include an `Age` response header. Decisions such as `MISS`, `HIT`, `COALESCED`, `STORED`, and `BYPASS` appear in `logs/proxy.log` under the connection ID.
 
 To measure which popular responses would qualify without serving cached responses, start the proxy in simulation mode:
 
@@ -118,7 +118,7 @@ After connecting to the destination, the proxy sends:
 HTTP/1.1 200 Connection Established
 ```
 
-The client worker spawns two relay threads for bidirectional forwarding and joins both before returning; it remains occupied until the tunnel closes. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
+The client worker uses `poll()` to relay traffic in both directions and remains occupied until the tunnel closes. The client and destination perform their TLS handshake through this tunnel. The proxy does not terminate TLS or decrypt application data, so HTTPS paths, cookies, and response contents are not available to its HTTP parser or logger.
 
 HTTPS tunnel contents cannot be cached by this proxy.
 
@@ -135,22 +135,15 @@ HTTPS tunnel contents cannot be cached by this proxy.
 
 **Worker reuse.** After finishing a connection a worker loops back and calls `WorkQueue::pop()`, blocking until the next item arrives. The same OS thread handles many successive connections. The `THREAD=` field in every log line makes this visible: the same thread ID appears across multiple `REQ-*` entries.
 
-**HTTPS tunnel occupancy.** `handleConnect()` spawns two relay threads for bidirectional forwarding and joins both before returning. The client worker thread is blocked for the full lifetime of the tunnel. The 120-second idle timeout resets when traffic flows in either direction; an active tunnel can last longer than the idle window, so plan the pool size accordingly.
+**HTTPS tunnel occupancy.** `handleConnect()` uses `poll()` to watch both sockets from the client worker. That worker is occupied for the full lifetime of the tunnel. The 120-second idle timeout resets when traffic flows in either direction; an active tunnel can last longer than the idle window, so plan the pool size accordingly.
 
-**Shutdown and signal handling.** Pressing Ctrl+C (SIGINT) triggers a graceful shutdown through the following sequence:
+**Shutdown and signal handling.** The SIGINT handler sets a shutdown flag and restores the default handler. When SIGINT interrupts the main thread's blocked `accept()` call, `ProxyServer::start()` logs the shutdown request and returns. Its destructor then:
 
-1. The SIGINT handler — installed via `sigaction` without `SA_RESTART` — sets a `volatile sig_atomic_t` flag and restores the default handler. No other work is done inside the handler.
-2. The blocked `accept()` call is interrupted with `EINTR`. Because `SA_RESTART` is not set, the call is not automatically restarted.
-3. `ProxyServer::start()` catches the resulting exception, detects the shutdown flag, and logs `SIGINT received, initiating graceful shutdown` from normal program flow.
-4. `start()` returns, and the `ProxyServer` destructor runs the shutdown sequence:
-   - The listener socket is closed.
-   - `WorkQueue::stop()` wakes all idle workers.
-   - `WorkQueue::drain()` closes every socket still waiting in the queue.
-   - All worker threads are joined; workers that are mid-connection finish according to the existing timeout behaviour.
-   - Aggregate statistics are printed.
-5. When `main()` returns, static destructors run. `Cache::~Cache()` signals the housekeeping thread and joins it.
+1. Closes the listener, stops the queue, and closes queued connections.
+2. Joins the workers after their active connections finish or time out.
+3. Prints aggregate statistics.
 
-A second Ctrl+C during shutdown uses the restored default handler and terminates the process immediately. Active connections are not forcibly interrupted on the first signal; they complete or time out before their worker thread is joined.
+When `main()` returns, the cache's housekeeping thread is stopped and joined. A second Ctrl+C uses the restored default handler and terminates the process immediately. The first signal does not forcibly interrupt active connections. Because SIGINT is not directed specifically to the main thread, a signal handled by a worker may leave `accept()` blocked until another event interrupts it.
 
 `network::Socket` owns a socket descriptor, closes it on destruction, and supports move semantics. Its send operation handles partial writes, and its receive operation retries interrupted system calls. The program ignores `SIGPIPE` and uses `MSG_NOSIGNAL` when sending data.
 
@@ -225,12 +218,6 @@ Run the HTTP cache integration checks with:
 
 ```bash
 python3 tests/test_cache.py build/cpp_proxy
-```
-
-Run the graceful shutdown regression checks with:
-
-```bash
-python3 tests/test_sigint.py build/cpp_proxy
 ```
 
 The checks use loopback fixtures, the configured timeout values, and a temporary log directory. They take a few minutes and do not require root access or external servers.
@@ -484,7 +471,8 @@ multithread-proxy/
 |   |-- proxy/client_handler.hpp
 |   |-- proxy/cache.hpp
 |   |-- proxy/proxy_server.hpp
-|   `-- proxy/timeouts.hpp
+|   |-- proxy/timeouts.hpp
+|   `-- proxy/work_queue.hpp
 |-- src/
 |   |-- main.cpp
 |   |-- http/http_parser.cpp
@@ -512,8 +500,8 @@ multithread-proxy/
 - Cache scope is limited to simple, explicitly public HTTP responses; it does not cache HTTPS tunnels or persist across restarts.
 - Fixed worker pool (default 4 workers, 16-slot queue); HTTPS tunnels each occupy one worker for their full lifetime.
 - DNS resolution is not covered by the TCP connection timeout.
-- No periodic statistics reporting or traffic dashboard.
-- No TLS interception, log rotation, or traffic dashboard.
+- SIGINT shutdown may wait if a worker receives the signal while the main thread remains blocked in `accept()`.
+- No periodic statistics reporting, TLS interception, log rotation, or traffic dashboard.
 
 ## Author
 
