@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proxy Server — Proxy privacy dashboard</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="Proxy Server overview"><span class="brand-mark">P</span><span>Proxy Server<span class="brand-sub">YOUR PRIVACY PROXY</span></span></a>
+    <nav aria-label="Main navigation"><a href="#overview">Overview</a><a href="#rules">Domain rules</a><a href="#about">How it works</a></nav>
+    <span id="connection" class="connection" role="status">Connecting…</span>
+  </header>
+  <main>
+    <div id="dashboard">
+      <section id="overview" class="overview">
+        <div class="page-heading"><div><p class="eyebrow">PRIVACY AT A GLANCE</p><h1>Your proxy, at a glance.</h1><p>See what your proxy is doing. Choose what gets through.</p></div><span class="session">This session <span id="uptime">—</span></span></div>
+        <div id="offline" class="notice error" role="alert" hidden>Dashboard disconnected. The numbers below are the last known values. Check that the proxy and your proxy connection are running.</div>
+        <div class="summary-grid">
+          <article class="hero-card"><div class="hero-top"><span class="tag">BLOCKING ACTIVITY</span><span class="shield" aria-hidden="true">◇</span></div><p id="blocked-total" class="hero-number">0</p><h2>Connections kept out</h2><p>Known ads, trackers and domains you chose to block.</p><div class="hero-foot"><span class="status-dot"></span><span id="protection-state">Ad and tracker protection enabled</span></div></article>
+          <article class="metric panel"><span class="metric-index">01 / ADS</span><strong id="ads-count">0</strong><h2>Ad connections blocked</h2><p>Requests to known advertising domains.</p></article>
+          <article class="metric panel"><span class="metric-index">02 / TRACKERS</span><strong id="trackers-count">0</strong><h2>Tracker connections blocked</h2><p>Requests to known analytics and tracking domains.</p></article>
+          <article class="metric panel"><span class="metric-index">03 / YOUR RULES</span><strong id="custom-count">0</strong><h2>Custom blocks</h2><p>Connections stopped by your own domain list.</p></article>
+        </div>
+        <p class="caption">Counts are blocked HTTP requests or HTTPS connection attempts, not individual ads or unique trackers. Counters reset when the proxy restarts.</p>
+      </section>
+
+      <section class="panel configuration" aria-label="Proxy configuration">
+        <p class="eyebrow">CONNECT YOUR DEVICES</p><h2>Proxy configuration</h2>
+        <div class="config-grid"><div><h3>On this laptop (Kali)</h3><p id="config-local">—</p><p id="config-dashboard">—</p><p class="caption">Open the local dashboard directly. No browser proxy setting is needed.</p></div>
+        <div><h3>Other devices</h3><p id="config-network">—</p><p>Manual HTTP proxy · Authentication off</p><p class="caption">Once connected, open <strong>http://proxy.internal</strong>. All users share the rules.</p></div></div>
+        <p class="caption">Network addresses are detected at startup. Restart the proxy after the eth2 address changes.</p>
+      </section>
+      <section class="middle-grid" aria-label="Connection information">
+        <article class="panel health"><div class="section-heading"><div><p class="eyebrow">CONNECTION HEALTH</p><h2 id="health-title">Waiting for traffic</h2></div><span id="health-badge" class="pill">No samples yet</span></div><p id="health-description" class="muted">Use this proxy in your browser to see connection measurements.</p>
+          <div class="health-numbers"><div><strong id="latency">—</strong><span>Average origin connection</span></div><div><strong id="active">0</strong><span>Open or queued connections</span></div><div><strong id="success-rate">—</strong><span>Completed successfully</span></div></div>
+          <div class="traffic-bar" aria-hidden="true"><span id="bar-success"></span><span id="bar-blocked"></span><span id="bar-failed"></span></div>
+          <div class="legend"><span><i class="success-color"></i><span id="successful">0</span> completed</span><span><i class="blocked-color"></i><span id="blocked-small">0</span> blocked</span><span><i class="failed-color"></i><span id="failed">0</span> failed</span></div>
+          <p class="caption">Connection time measures DNS lookup + TCP connection to origins, excluding blocked requests and cache hits. It is not Wi-Fi strength or a speed test.</p>
+        </article>
+        <article class="panel cache"><p class="eyebrow">LESS REPEAT FETCHING</p><h2>Served from memory</h2><strong id="cache-bytes" class="cache-number">0 B</strong><p id="cache-description">0 cached responses served</p><p class="muted">Fresh public HTTP responses can be reused. HTTPS content stays encrypted and is not cached.</p><div class="small-stat"><span>Browsing history on disk</span><strong id="logging-state">Off</strong></div><p class="caption" id="logging-description">Default logs omit client addresses, destinations and URL paths. No request log file is written.</p></article>
+      </section>
+
+      <section class="panel devices-panel" aria-label="Device statistics">
+        <p class="eyebrow">TRAFFIC BY CLIENT</p><h2>Devices <span class="pill" id="device-count">0</span></h2>
+        <p class="muted">Grouped by the client IP seen by this proxy. Rules remain shared.</p>
+        <div class="device-table-wrap"><table class="device-table"><thead><tr><th>Client / hostname</th><th>Active</th><th>Total</th><th>Completed</th><th>Failed</th><th>Blocked</th><th>Completed traffic I/O</th><th>Last activity</th></tr></thead><tbody id="device-rows"></tbody></table></div>
+        <p id="devices-empty" class="empty">No browsing traffic yet. Devices appear when they use the proxy.</p>
+        <p id="devices-limit" class="caption"></p>
+        <p class="caption">Network hostnames are best-effort labels, not verified device names. Shared IPs or SSH tunnels can combine devices; changing IPs creates new rows. Counters reset on restart. Traffic I/O counts reads and writes on both sides of finished connections, not unique download bytes. All dashboard users can see these IPs and totals; no destination history is shown.</p>
+      </section>
+      <section id="rules" class="rules-section">
+        <div class="section-heading"><div><p class="eyebrow">MAKE IT YOURS</p><h2>Your connection, your rules.</h2><p class="muted">Changes save automatically and apply to new requests on this proxy.</p></div></div>
+        <div class="rules-grid">
+          <article class="panel protections"><h3>Built-in protection</h3><p class="muted">A small, transparent starter list.</p>
+            <label class="switch-row"><span><strong>Block advertising domains</strong><small>Includes known Google ad-serving domains.</small></span><input id="toggle-ads" type="checkbox" role="switch" aria-label="Block advertising domains"></label>
+            <label class="switch-row"><span><strong>Block tracker domains</strong><small>Includes Google Analytics and Microsoft Clarity.</small></span><input id="toggle-trackers" type="checkbox" role="switch" aria-label="Block tracker domains"></label>
+            <details><summary>View included domains</summary><p class="caption">Domains and all their subdomains are matched. This list does not cover every ad or tracker.</p><div id="defaults" class="default-list"></div></details>
+            <div class="tip"><strong>Something stopped working?</strong><p>Add that domain as an allow exception. Allow exceptions take priority over every block rule.</p></div>
+          </article>
+          <article class="panel custom-rules"><h3>Add a domain</h3><p class="muted">Enter a hostname such as <code>example.com</code>. Its subdomains are included.</p>
+            <form id="rule-form"><label for="domain">Domain name</label><input id="domain" name="domain" placeholder="example.com" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="253" required><div class="input-row rule-actions"><label class="sr-only" for="rule-kind">Rule type</label><select id="rule-kind"><option value="block">Always block</option><option value="allow">Allow exception</option></select><button type="submit">Add domain</button></div></form>
+            <p id="message" class="message" role="status" aria-live="polite"></p>
+            <div class="list-heading"><h3>Saved rules <span id="rule-count" class="pill">0</span></h3><label class="sr-only" for="search">Search saved rules</label><input id="search" type="search" placeholder="Find a domain…"></div>
+            <div id="saved-rules" class="saved-rules"></div>
+            <p class="caption">This prototype has no login. Anyone connected can change these rules. Rules are shared by everyone using this proxy and survive restarts. Existing HTTPS tunnels finish normally; reconnect to apply a new rule.</p>
+          </article>
+        </div>
+      </section>
+      <section id="about" class="about panel"><div><p class="eyebrow">CLEAR BOUNDARIES</p><h2>Privacy you can understand.</h2></div><div><h3>Only traffic sent here</h3><p>Configure your browser or device to use this proxy. Opening this dashboard alone does not protect browsing.</p><p id="proxy-address" class="endpoint">Proxy: —</p></div><div><h3>Encrypted stays encrypted</h3><p>HTTPS is filtered by destination domain. The proxy cannot inspect pages, remove every ad, or stop tracking hosted on a site you allow. Direct IP traffic can bypass domain rules.</p></div></section>
+      <footer><span>Proxy Server · Multithreaded privacy proxy</span><span>Local dashboard · No external scripts, fonts or analytics</span></footer>
+    </div>
+  </main>
+</body>
+</html>

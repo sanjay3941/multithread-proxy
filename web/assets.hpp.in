@@ -1,0 +1,7 @@
+#pragma once
+namespace resources {
+inline constexpr char html[] = R"asset(@DASHBOARD_HTML@)asset";
+inline constexpr char css[] = R"asset(@DASHBOARD_CSS@)asset";
+inline constexpr char js[] = R"asset(@DASHBOARD_JS@)asset";
+inline constexpr char domains[] = R"asset(@DEFAULT_DOMAINS@)asset";
+}

@@ -21,15 +21,15 @@ namespace proxy {
 /// naturally before the join.
 class ProxyServer {
 public:
-    static constexpr std::size_t kDefaultWorkerCount = 4;
-    static constexpr std::size_t kDefaultQueueSize   = 16;
+    static constexpr std::size_t kDefaultWorkerCount = 16;
+    static constexpr std::size_t kDefaultQueueSize   = 64;
 
     /// \param port          TCP port to listen on.
-    /// \param bindAddress   IPv4 address to bind (default "0.0.0.0").
-    /// \param workerCount   Fixed number of worker threads (default 4).
-    /// \param queueSize     Maximum pending connections in the queue (default 16).
+    /// \param bindAddresses Explicit IPv4 addresses sharing one port and worker pool.
+    /// \param workerCount   Fixed number of worker threads (default 16).
+    /// \param queueSize     Maximum pending connections in the queue (default 64).
     explicit ProxyServer(std::uint16_t port,
-                         std::string   bindAddress = "0.0.0.0",
+                         std::vector<std::string> bindAddresses = {"127.0.0.1"},
                          std::size_t   workerCount = kDefaultWorkerCount,
                          std::size_t   queueSize   = kDefaultQueueSize);
     ~ProxyServer();
@@ -52,9 +52,9 @@ private:
     void stop();
 
     std::uint16_t            port_;
-    std::string              bindAddress_;
+    std::vector<std::string> bindAddresses_;
     std::size_t              workerCount_;
-    network::Socket          listener_;
+    std::vector<network::Socket> listeners_;
     WorkQueue                queue_;
     std::vector<std::thread> workers_;
 };

@@ -18,7 +18,7 @@ bool WorkQueue::push(WorkItem item) {
 bool WorkQueue::pop(WorkItem& out) {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return !queue_.empty() || stopped_; });
-    if (queue_.empty()) return false;
+    if (stopped_ || queue_.empty()) return false;
     out = std::move(queue_.front());
     queue_.pop();
     return true;
@@ -35,7 +35,10 @@ void WorkQueue::stop() {
 void WorkQueue::drain() {
     std::lock_guard<std::mutex> lock(mutex_);
     // Each WorkItem destructs here, closing its socket via ~Socket().
-    while (!queue_.empty()) queue_.pop();
+    while (!queue_.empty()) {
+        logging::ProxyStatistics::instance().finish(queue_.front().stats, false);
+        queue_.pop();
+    }
 }
 
 } // namespace proxy

@@ -1,5 +1,6 @@
 """Loopback regression tests. Usage: python3 tests/test_timeouts.py build/cpp_proxy"""
 import concurrent.futures
+import os
 import pathlib
 import re
 import socket
@@ -244,7 +245,7 @@ if __name__ == '__main__':
         # for a full timeout. Give each case its own worker so queueing does
         # not distort the timing assertions.
         proxy = subprocess.Popen([str(binary), str(proxy_port), str(len(tests))],
-                                 cwd=work, stdout=output, stderr=output)
+                                 cwd=work, env={**{k: v for k, v in os.environ.items() if not k.startswith("PROXY_")}, "PROXY_DETAILED_LOGS": "1", "PROXY_DASHBOARD_PORT": "0", "PROXY_BIND_ADDRESS": "127.0.0.1"}, stdout=output, stderr=output)
         try:
             for _ in range(50):
                 if proxy.poll() is not None:

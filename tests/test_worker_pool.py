@@ -1,4 +1,5 @@
 """Loopback check for queue rejection, recovery, and worker reuse."""
+import os
 import pathlib
 import re
 import socket
@@ -68,7 +69,7 @@ def main(binary):
         with listen() as probe:
             proxy_port = probe.getsockname()[1]
         with (work / 'console.log').open('w') as output:
-            proc = subprocess.Popen([str(binary), str(proxy_port), '1', '1'], cwd=work,
+            proc = subprocess.Popen([str(binary), str(proxy_port), '1', '1'], cwd=work, env={**{k: v for k, v in os.environ.items() if not k.startswith("PROXY_")}, "PROXY_DETAILED_LOGS": "1", "PROXY_DASHBOARD_PORT": "0", "PROXY_BIND_ADDRESS": "127.0.0.1"},
                                     stdout=output, stderr=output)
             clients = []
             try:

@@ -3,6 +3,9 @@
 #include "proxy/client_handler.hpp"
 #include "logging/logger.hpp"
 #include "logging/statistics.hpp"
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 
 namespace proxy {
 
@@ -10,10 +13,10 @@ namespace proxy {
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 
-ProxyServer::ProxyServer(std::uint16_t port, std::string bindAddress,
+ProxyServer::ProxyServer(std::uint16_t port, std::vector<std::string> bindAddresses,
                          std::size_t workerCount, std::size_t queueSize)
     : port_(port)
-    , bindAddress_(std::move(bindAddress))
+    , bindAddresses_(std::move(bindAddresses))
     , workerCount_(workerCount)
     , queue_(queueSize) {
     workers_.reserve(workerCount_);
@@ -47,7 +50,7 @@ ProxyServer::~ProxyServer() {
 // Cache::~Cache() is called during static destruction; it sets stopping_,
 // signals the housekeeping CV, and joins the janitor thread.
 void ProxyServer::stop() {
-    listener_.close();
+    listeners_.clear();
     queue_.stop();
     queue_.drain();
     for (auto& w : workers_) {
@@ -79,51 +82,56 @@ void ProxyServer::workerLoop() {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-// shutdownFlag is a pointer to the volatile sig_atomic_t written by the
-// SIGINT handler in main.cpp.  The handler is installed without SA_RESTART,
-// so SIGINT interrupts accept() with EINTR rather than restarting it.
-// socket.cpp::accept() does not retry EINTR, so the exception is thrown
-// immediately.  The catch block below inspects the flag to distinguish a
-// graceful shutdown from a genuine accept() error.
+// Poll periodically so shutdown does not depend on which thread receives
+// SIGINT or SIGTERM. Nonblocking accept also handles readiness races.
 void ProxyServer::start(const volatile sig_atomic_t* shutdownFlag) {
-    listener_ = network::Socket::createTcp();
-    listener_.bindAndListen(bindAddress_, port_);
-    logging::Logger::instance().log(logging::LogLevel::INFO,
-        "PROXY_LISTENING ADDRESS=" + bindAddress_ + ":" + std::to_string(port_));
+    std::vector<pollfd> ready;
+    for (const auto& address : bindAddresses_) {
+        auto listener = network::Socket::createTcp();
+        listener.bindAndListen(address, port_);
+        const int flags = ::fcntl(listener.nativeHandle(), F_GETFL, 0);
+        if (flags < 0 || ::fcntl(listener.nativeHandle(), F_SETFL, flags | O_NONBLOCK) < 0)
+            throw std::runtime_error("Unable to configure listener.");
+        ready.push_back({listener.nativeHandle(), POLLIN, 0});
+        listeners_.push_back(std::move(listener));
+    }
+    for (const auto& address : bindAddresses_)
+        logging::Logger::instance().log(logging::LogLevel::INFO,
+            "PROXY_LISTENING ADDRESS=" + address + ":" + std::to_string(port_));
 
     for (;;) {
-        try {
-            auto client = listener_.accept();
-            const auto peer = client.peerAddress();
-            auto stats = logging::ProxyStatistics::instance().begin(peer.first, peer.second);
+        if (shutdownFlag && *shutdownFlag) {
             logging::Logger::instance().log(logging::LogLevel::INFO,
-                "[" + stats->connectionId + "] CLIENT=" + peer.first + ":" +
-                std::to_string(peer.second) + " STATUS=ACCEPTED");
-
-            // Attempt to hand off to a worker via the queue.
-            // push() takes the WorkItem by value; if it returns false the
-            // local WorkItem destructs here, closing the client socket.
-            if (!queue_.push(WorkItem{std::move(client), stats})) {
-                logging::Logger::instance().log(logging::LogLevel::WARN,
-                    "[" + stats->connectionId + "] CLIENT=" + peer.first + ":" +
-                    std::to_string(peer.second) +
-                    " STATUS=REJECTED REASON=QUEUE_FULL");
-                logging::ProxyStatistics::instance().finish(stats, /*successful=*/false);
-            }
-        } catch (const std::exception& error) {
-            if (shutdownFlag && *shutdownFlag) {
-                // SIGINT interrupted accept().  Log the graceful shutdown
-                // message from normal program flow (not from the signal handler)
-                // then exit the loop.  The existing stop() path runs in the
-                // destructor: queue drained, workers joined, stats printed.
-                logging::Logger::instance().log(logging::LogLevel::INFO,
-                    "SIGINT received, initiating graceful shutdown");
-            } else {
-                // Genuine accept() failure — log as error and exit.
-                logging::Logger::instance().log(logging::LogLevel::ERROR,
-                    std::string("ACCEPT_FAILURE ERROR=") + error.what());
-            }
+                "Shutdown requested, initiating graceful shutdown");
             break;
+        }
+        const int available = ::poll(ready.data(), ready.size(), 200);
+        if (available == 0 || (available < 0 && errno == EINTR)) continue;
+        if (available < 0) throw std::runtime_error("Listener poll failed.");
+        for (std::size_t i = 0; i < ready.size(); ++i) {
+            if (!(ready[i].revents & POLLIN)) continue;
+            try {
+                auto client = listeners_[i].accept();
+                const auto peer = client.peerAddress();
+                auto stats = logging::ProxyStatistics::instance().begin(peer.first, peer.second);
+                logging::Logger::instance().log(logging::LogLevel::INFO,
+                    "[" + stats->connectionId + "] CLIENT=" + peer.first + ":" +
+                    std::to_string(peer.second) + " STATUS=ACCEPTED");
+
+                // Attempt to hand off to a worker via the queue.
+                // push() takes the WorkItem by value; if it returns false the
+                // local WorkItem destructs here, closing the client socket.
+                if (!queue_.push(WorkItem{std::move(client), stats})) {
+                    logging::Logger::instance().log(logging::LogLevel::WARN,
+                        "[" + stats->connectionId + "] CLIENT=" + peer.first + ":" +
+                        std::to_string(peer.second) +
+                        " STATUS=REJECTED REASON=QUEUE_FULL");
+                    logging::ProxyStatistics::instance().finish(stats, /*successful=*/false);
+                }
+            } catch (const std::exception&) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                throw;
+            }
         }
     }
 }

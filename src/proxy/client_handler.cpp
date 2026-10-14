@@ -3,6 +3,8 @@
 #include "http/http_parser.hpp"
 #include "logging/logger.hpp"
 #include "proxy/cache.hpp"
+#include "proxy/dashboard.hpp"
+#include "proxy/privacy.hpp"
 #include "proxy/timeouts.hpp"
 
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <poll.h>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -191,10 +194,35 @@ void ClientHandler::run() noexcept {
             "[" + stats_->connectionId + "] CLIENT=" + stats_->clientIp + ":" +
             std::to_string(stats_->clientPort) + " STATUS=REQUEST_RECEIVED");
         const auto parsed = http::HttpParser::parseRequest(request.first);
+        if (Privacy::normalizeHost(parsed.host) == "proxy.internal") {
+            stats_->dashboard = true;
+            logging::ProxyStatistics::instance().finish(stats_, true);
+            responseStarted_ = true;
+            Dashboard::serveProxy(client_, parsed, request.first, request.second);
+            return;
+        }
         stats_->method = parsed.method;
         stats_->targetHost = parsed.host;
         stats_->targetPort = parsed.port;
         stats_->protocol = parsed.method == "CONNECT" ? "HTTPS" : "HTTP";
+        const auto blockedCategory = Privacy::instance().check(parsed.host);
+        if (!blockedCategory.empty()) {
+            stats_->blocked = true;
+            stats_->blockedCategory = blockedCategory;
+            stats_->status = "BLOCKED";
+            stats_->httpStatus = 403;
+            const std::string body = "Blocked by your proxy privacy rules. Manage exceptions in the local dashboard.\n";
+            const std::string response = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n"
+                "Cache-Control: no-store\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body;
+            responseStarted_ = true;
+            client_.sendAll(response.data(), response.size());
+            stats_->bytesSent.fetch_add(response.size());
+            logging::Logger::instance().log(logging::LogLevel::INFO,
+                "[" + stats_->connectionId + "] STATUS=BLOCKED CATEGORY=" + blockedCategory);
+            logging::ProxyStatistics::instance().finish(stats_, false);
+            return;
+        }
         logging::Logger::instance().log(logging::LogLevel::INFO,
             "[" + stats_->connectionId + "] PROTOCOL=" + stats_->protocol +
             " METHOD=" + parsed.method + " TARGET=" + parsed.host + ":" + parsed.port +
@@ -225,7 +253,7 @@ void ClientHandler::run() noexcept {
     logging::ProxyStatistics::instance().finish(stats_, successful);
 }
 
-void ClientHandler::handleHttp(const std::string& requestHead, const std::string& buffered,
+void ClientHandler::handleHttp(const std::string&, const std::string& buffered,
                                const http::HttpRequest& parsed) {
     auto& cache = Cache::instance();
     const std::string key = parsed.host + ":" + parsed.port + parsed.path;
@@ -248,6 +276,7 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
             stats_->httpStatus = 200;
             client_.sendAll(lookup.response.data(), lookup.response.size());
             stats_->bytesSent.fetch_add(lookup.response.size());
+            Privacy::instance().cacheHit(lookup.response.size());
             return;
         }
         if (lookup.action == Cache::Action::Wait) {
@@ -258,6 +287,7 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
                 stats_->httpStatus = 200;
                 client_.sendAll(response.data(), response.size());
                 stats_->bytesSent.fetch_add(response.size());
+                Privacy::instance().cacheHit(response.size());
                 return;
             }
             cacheLog("COALESCE_FALLBACK");
@@ -276,8 +306,11 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
         " STATUS=UPSTREAM_CONNECTING");
 
     // Connect to upstream with a bounded timeout.
+    const auto connectStarted = Clock::now();
     auto remote = network::Socket::connectTo(parsed.host, parsed.port,
                                              timeouts::UPSTREAM_CONNECT_TIMEOUT);
+    Privacy::instance().connected(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - connectStarted).count());
 
     // Bound how long we wait for the upstream server to respond.
     remote.setReceiveTimeout(timeouts::UPSTREAM_READ_TIMEOUT);
@@ -287,22 +320,33 @@ void ClientHandler::handleHttp(const std::string& requestHead, const std::string
         "[" + stats_->connectionId + "] TARGET=" + parsed.host + ":" + parsed.port +
         " STATUS=UPSTREAM_CONNECTED");
 
-    std::istringstream input(requestHead);
-    std::string line;
-    std::getline(input, line);
     std::ostringstream outgoing;
-    outgoing << parsed.method << ' ' << parsed.path << ' ' << parsed.version << "\r\n";
-    while (std::getline(input, line)) {
-        if (line == "\r" || line.empty()) break;
-        const auto separator = line.find(':');
-        if (separator == std::string::npos) continue;
-        const auto name = line.substr(0, separator);
-        std::string lowerName = name;
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (lowerName == "proxy-connection" || lowerName == "connection") continue;
-        outgoing << line << "\r\n";
+    std::set<std::string> connectionFields;
+    const auto connection = parsed.headers.find("connection");
+    if (connection != parsed.headers.end()) {
+        std::istringstream tokens(connection->second);
+        for (std::string token; std::getline(tokens, token, ',');) {
+            const auto first = token.find_first_not_of(" \t");
+            const auto last = token.find_last_not_of(" \t");
+            if (first == std::string::npos) continue;
+            token = token.substr(first, last - first + 1);
+            std::transform(token.begin(), token.end(), token.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            connectionFields.insert(token);
+        }
     }
+    outgoing << parsed.method << ' ' << parsed.path << ' ' << parsed.version << "\r\n";
+    for (const auto& header : parsed.headers) {
+        const auto& lowerName = header.first;
+        if (lowerName == "host" || lowerName == "proxy-connection" || lowerName == "connection" ||
+            lowerName == "proxy-authorization" || lowerName == "forwarded" ||
+            lowerName == "x-forwarded-for" || lowerName == "x-real-ip" || lowerName == "via" ||
+            lowerName == "keep-alive" || lowerName == "te" || lowerName == "trailer" ||
+            lowerName == "upgrade" || connectionFields.count(lowerName)) continue;
+        outgoing << lowerName << ": " << header.second << "\r\n";
+    }
+    outgoing << "Host: " << (parsed.host.find(':') == std::string::npos ? parsed.host : "[" + parsed.host + "]")
+             << ':' << parsed.port << "\r\n";
     outgoing << "Connection: close\r\n\r\n";
     const auto serialized = outgoing.str();
     remote.sendAll(serialized.data(), serialized.size());
@@ -364,8 +408,11 @@ void ClientHandler::handleConnect(const std::string&, const std::string& buffere
         " STATUS=UPSTREAM_CONNECTING");
 
     // Connect to upstream with a bounded timeout.
+    const auto connectStarted = Clock::now();
     auto remote = network::Socket::connectTo(parsed.host, parsed.port,
                                              timeouts::UPSTREAM_CONNECT_TIMEOUT);
+    Privacy::instance().connected(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - connectStarted).count());
 
     remote.setSendTimeout(timeouts::SOCKET_WRITE_TIMEOUT);
     logging::Logger::instance().log(logging::LogLevel::INFO,

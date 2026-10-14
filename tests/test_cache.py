@@ -98,7 +98,10 @@ def run(binary, simulation=False):
     proxy_port = free_port()
     with tempfile.TemporaryDirectory(prefix='proxy-cache-test-') as directory:
         work = pathlib.Path(directory)
-        env = os.environ.copy()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PROXY_")}
+        env['PROXY_DETAILED_LOGS'] = '1'
+        env['PROXY_DASHBOARD_PORT'] = '0'
+        env['PROXY_BIND_ADDRESS'] = '127.0.0.1'
         if simulation:
             env['PROXY_CACHE_SIMULATE'] = '1'
         with (work / 'console.log').open('w') as output:

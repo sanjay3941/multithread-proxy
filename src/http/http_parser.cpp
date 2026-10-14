@@ -72,8 +72,29 @@ HttpRequest HttpParser::parseRequest(const std::string& requestHead) {
         if (header.empty()) break;
         const auto separator = header.find(':');
         if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
-        request.headers[lower(trim(header.substr(0, separator)))] =
-            trim(header.substr(separator + 1));
+        if (!request.headers.emplace(lower(trim(header.substr(0, separator))),
+            trim(header.substr(separator + 1))).second)
+            throw std::invalid_argument("duplicate HTTP headers are unsupported");
+    }
+
+    if (request.headers.count("transfer-encoding"))
+        throw std::invalid_argument("chunked request bodies are unsupported");
+    const auto connection = request.headers.find("connection");
+    if (connection != request.headers.end()) {
+        std::istringstream tokens(connection->second);
+        for (std::string token; std::getline(tokens, token, ',');) {
+            token = lower(trim(token));
+            if (token == "host" || token == "content-length" || token == "transfer-encoding")
+                throw std::invalid_argument("Connection cannot remove routing or framing headers");
+        }
+    }
+    const auto length = request.headers.find("content-length");
+    if (length != request.headers.end()) {
+        std::size_t bytes = 0;
+        const auto& value = length->second;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), bytes);
+        if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+            throw std::invalid_argument("invalid Content-Length");
     }
 
     if (request.method == "CONNECT") {

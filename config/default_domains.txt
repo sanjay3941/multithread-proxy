@@ -1,0 +1,9 @@
+# Conservative starter rules, not a comprehensive ad-blocking subscription.
+# Ad domains: https://policies.google.com/technologies/ads
+# Analytics: https://support.google.com/analytics/answer/12017362
+# Clarity: https://learn.microsoft.com/en-us/clarity/setup-and-installation/clarity-csp
+ads doubleclick.net
+ads googlesyndication.com
+ads googleadservices.com
+trackers google-analytics.com
+trackers clarity.ms
