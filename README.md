@@ -217,6 +217,4 @@ Remaining limitations include one HTTP request per connection, incomplete HTTP/1
 ## Author
 
 Sanjay Viswaq
-B.Tech Computer Science and Engineering, Cybersecurity Specialization
-
-[Repository](https://github.com/sanjay3941/multithread-proxy)
+B.Tech Computer Science and Engineering (Cyber Security)
